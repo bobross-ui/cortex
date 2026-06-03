@@ -4,7 +4,7 @@ import html
 from pathlib import Path
 import time
 from cortex.ingestion.base import SourceParser
-from cortex.ingestion.normalize import load_js_array, normalize_tweet, parse_twitter_dt
+from cortex.ingestion.normalize import iter_js_array, load_js_array, normalize_tweet, parse_twitter_dt
 from cortex.models import ContentItem, IngestionReport
 
 
@@ -47,47 +47,44 @@ class TwitterParser(SourceParser):
         tweet_files = self._tweet_files(data)
         report.files_seen = len(tweet_files)
 
-        rows = []
-        for path in tweet_files:
-            rows.extend(load_js_array(path))
-
         authored: dict[str, dict] = {}
         seen: set[str] = set()
-        for row in rows:
-            tweet = row.get("tweet") if isinstance(row, dict) else None
-            if not isinstance(tweet, dict) or not tweet.get("id_str") or "full_text" not in tweet:
-                report.items_skipped_malformed += 1
-                continue
+        for path in tweet_files:
+            for row in iter_js_array(path):
+                tweet = row.get("tweet") if isinstance(row, dict) else None
+                if not isinstance(tweet, dict) or not tweet.get("id_str") or "full_text" not in tweet:
+                    report.items_skipped_malformed += 1
+                    continue
 
-            tweet_id = tweet["id_str"]
-            if tweet_id in seen:
-                continue
-            seen.add(tweet_id)
+                tweet_id = tweet["id_str"]
+                if tweet_id in seen:
+                    continue
+                seen.add(tweet_id)
 
-            # TODO: validate vs real archive
-            if tweet["full_text"].startswith("RT @"):
-                self._drop_noise(report, "retweet")
-                continue
+                # TODO: validate vs real archive
+                if tweet["full_text"].startswith("RT @"):
+                    self._drop_noise(report, "retweet")
+                    continue
 
-            self_reply = self._is_self_reply(tweet, own_id, own_handle)
-            if tweet.get("in_reply_to_status_id_str") is not None and not self_reply:
-                self._drop_noise(report, "reply_to_other")
-                continue
+                self_reply = self._is_self_reply(tweet, own_id, own_handle)
+                if tweet.get("in_reply_to_status_id_str") is not None and not self_reply:
+                    self._drop_noise(report, "reply_to_other")
+                    continue
 
-            text, quote_of_id, media_count = normalize_tweet(tweet)
-            if not text:
-                report.items_skipped_empty += 1
-                continue
+                text, quote_of_id, media_count = normalize_tweet(tweet)
+                if not text:
+                    report.items_skipped_empty += 1
+                    continue
 
-            authored[tweet_id] = {
-                "id": tweet_id,
-                "text": text,
-                "quote_of_id": quote_of_id,
-                "media_count": media_count,
-                "lang": tweet.get("lang"),
-                "created_at": parse_twitter_dt(tweet.get("created_at")),
-                "parent": tweet.get("in_reply_to_status_id_str") if self_reply else None,
-            }
+                authored[tweet_id] = {
+                    "id": tweet_id,
+                    "text": text,
+                    "quote_of_id": quote_of_id,
+                    "media_count": media_count,
+                    "lang": tweet.get("lang"),
+                    "created_at": parse_twitter_dt(tweet.get("created_at")),
+                    "parent": tweet.get("in_reply_to_status_id_str") if self_reply else None,
+                }
 
         for root_id, members in self._stitched_threads(authored):
             if len(members) > 1:

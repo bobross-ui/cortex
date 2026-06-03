@@ -22,6 +22,30 @@ def get_existing_hashes(conn, source_platform: str, external_ids: Sequence[str])
         return {external_id: content_hash for external_id, content_hash in cur.fetchall()}
 
 
+def get_reusable_vectors(
+    conn,
+    content_hashes: Sequence[str],
+    embed_model: str,
+) -> dict[str, object]:
+    """Map content_hash to an existing vector produced by the same embedding model."""
+    if not content_hashes:
+        return {}
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (content_hash) content_hash, embedding
+            FROM chunks
+            WHERE content_hash = ANY(%s)
+              AND embed_model = %s
+              AND embedding IS NOT NULL
+            ORDER BY content_hash, id
+            """,
+            (list(content_hashes), embed_model),
+        )
+        return {content_hash: embedding for content_hash, embedding in cur.fetchall()}
+
+
 def upsert_document(conn, item, content_hash: str) -> int:
     """Insert or update one document row and return its deterministic database id."""
     with conn.cursor() as cur:

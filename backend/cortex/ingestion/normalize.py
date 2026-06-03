@@ -1,8 +1,11 @@
 import html
 import json
 import re
+from collections.abc import Iterator
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+import ijson
 
 
 _STATUS_RE = re.compile(r"(?:twitter|x)\.com/[^/]+/status/(\d+)")
@@ -16,6 +19,44 @@ def load_js_array(path: Path) -> list:
     """Read a `window.YTD.<name>.partN = [ ... ]` file -> parsed JSON list. Tolerates BOM."""
     raw = path.read_text(encoding="utf-8-sig")
     return json.loads(raw[raw.index("["):])
+
+
+def iter_js_array(path: Path) -> Iterator[dict]:
+    """Stream elements of a `window.YTD.<name>.partN = [ ... ]` export file."""
+    with path.open("rb") as fileobj:
+        offset = 0
+        while True:
+            chunk = fileobj.read(4096)
+            if not chunk:
+                raise ValueError(f"no JSON array found in {path}")
+            index = chunk.find(b"[")
+            if index != -1:
+                offset += index
+                break
+            offset += len(chunk)
+
+        fileobj.seek(offset)
+        builder = None
+        for prefix, event, value in ijson.parse(fileobj, use_float=True):
+            if prefix == "" and event == "start_array":
+                continue
+            if prefix == "" and event == "end_array":
+                return
+
+            if builder is None:
+                if prefix != "item":
+                    raise ValueError(f"expected root JSON array in {path}")
+                if event in {"start_map", "start_array"}:
+                    builder = ijson.ObjectBuilder()
+                    builder.event(event, value)
+                else:
+                    yield value
+                continue
+
+            builder.event(event, value)
+            if prefix == "item" and event in {"end_map", "end_array"}:
+                yield builder.value
+                builder = None
 
 
 def normalize_tweet(tweet: dict) -> tuple[str, str | None, int]:

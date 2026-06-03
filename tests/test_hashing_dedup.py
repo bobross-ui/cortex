@@ -1,12 +1,67 @@
-from cortex.pipeline.index import attach_embeddings, sha256_text, unique_embed_texts
+from dataclasses import replace
+from datetime import datetime, timezone
+
+from cortex.models import ContentItem
+from cortex.pipeline.index import (
+    attach_embeddings,
+    document_change_hash,
+    sha256_text,
+    unique_embed_texts,
+)
 
 
-def test_document_content_hash_is_sha256_of_raw_text():
+def test_sha256_text_is_stable():
     text = "Raw authored source text."
 
     assert sha256_text(text) == (
         "611bc08bff26f1936a8af2f7be3d072e1f33a612eddc1440acb6c98b3e95b17f"
     )
+
+
+def test_document_change_hash_includes_embed_context():
+    item = ContentItem(
+        source_platform="twitter",
+        external_id="1",
+        content_type="post",
+        text="Raw authored source text.",
+        author_handle="author",
+        created_at=datetime(2024, 5, 15, tzinfo=timezone.utc),
+        url=None,
+    )
+
+    original = document_change_hash(item, "Original bio")
+
+    assert original != document_change_hash(
+        replace(item, text="Updated authored source text."),
+        "Original bio",
+    )
+    assert original != document_change_hash(item, "Updated bio")
+    assert original != document_change_hash(
+        replace(item, source_platform="linkedin"),
+        "Original bio",
+    )
+    assert original != document_change_hash(
+        replace(item, content_type="article"),
+        "Original bio",
+    )
+    assert original != document_change_hash(
+        replace(item, created_at=datetime(2024, 5, 16, tzinfo=timezone.utc)),
+        "Original bio",
+    )
+
+
+def test_bio_document_change_hash_does_not_self_include_blurb():
+    bio = ContentItem(
+        source_platform="twitter",
+        external_id="profile",
+        content_type="bio",
+        text="The profile bio.",
+        author_handle="author",
+        created_at=None,
+        url=None,
+    )
+
+    assert document_change_hash(bio, "Old bio") == document_change_hash(bio, "New bio")
 
 
 def test_chunk_content_hash_is_sha256_of_embed_text():

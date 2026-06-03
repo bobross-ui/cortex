@@ -31,15 +31,15 @@ An end-to-end system built across four layers, each of which matters:
 
 ## Roadmap
 
-This README grows one layer at a time. **Layers 1–3** are detailed below; later sections are added
-as each layer lands.
+**Layers 1–3 are shipped.** Layer 4's implementation mechanisms are present, while its controlled
+large-scale proof remains deferred.
 
 | Layer | Scope | Status |
 |---|---|---|
 | **1 — Ingestion** | Pluggable parsers; authored-content extraction; Twitter first | ✅ **Shipped** |
 | **2 — Vector KB** | Structure-aware chunking, local embeddings, pgvector schema | ✅ **Shipped** |
 | **3 — Chat (RAG)** | Retrieval, grounded prompt, cited answers, UI | ✅ **Shipped** |
-| 4 — Efficiency | Streaming parse, multiprocessing/stress numbers, RSS measurement | ⚪ Planned |
+| **4 — Efficiency** | Streaming parse, batched writes, cross-run reuse, correctness invalidation | 🟡 **Mechanisms shipped; stress proof deferred** |
 
 ---
 
@@ -60,7 +60,7 @@ what it dropped** so the editorial decision is provable, not just claimed.
 | **Parser-owned normalization** | The parser emits clean canonical text (unescape entities, expand/strip links, collapse whitespace, drop empty/media-only items) so downstream hashing/embedding is stable. |
 | **Stable `external_id`** | Native platform id (root id for threads; `profile` for bio) → re-ingesting the same export updates in place instead of duplicating. |
 | **`metadata` convention** | Per-`content_type` JSONB extras follow a documented key convention → extensible to new content types **without a migration**. |
-| **Twitter first, sources verified** | The Twitter archive format was verified against the canonical community parser. Two discriminators (retweet & quote-tweet shape) are **flagged unverified**, pending validation against a real export. |
+| **Twitter first, sources verified** | The Twitter archive format was verified against the canonical community parser and a real June 2026 export. Quote-status link handling is validated; retweet-shape handling remains unverified because the real export contained no retweets. |
 | **Defensive parsing** | Tolerate missing fields; skip malformed/empty items and record them; never crash a run on one bad item. |
 
 ### The canonical model
@@ -88,8 +88,9 @@ class ContentItem:
 
 ### Tech (Layer 1)
 
-Python **3.11+**, **standard library only** (`json`, `html`, `re`, `datetime`, `pathlib`,
-`dataclasses`), with **pytest** for tests. No database, embeddings, or network calls at this layer.
+Python **3.11+**, the standard library (`json`, `html`, `re`, `datetime`, `pathlib`, `dataclasses`),
+and `ijson` for streaming export arrays, with **pytest** for tests. No database, embeddings, or
+network calls at this layer.
 
 ---
 
@@ -111,8 +112,8 @@ Layer 2 only provisions the storage/search seam that makes those cheap to add la
 | **Raw text ≠ embed text** | `documents.text` and `chunks.text` stay raw for source display, citations, and FTS. `chunks.embed_text` adds deterministic context only for embedding. Hashes are separate for documents vs chunks. |
 | **Structure-aware chunking** | Social records stay atomic by default. Long stitched threads split on paragraphs/sentences with token budgets and overlap; no character-window shredding. |
 | **Templated enrichment seam** | A single `build_embed_text()` function adds `[platform · type · date]` plus the profile bio as standing context. Future LLM enrichment can swap in here without a schema rewrite. |
-| **Incremental document skip** | `sha256(documents.text)` detects unchanged documents. Re-indexing an unchanged export skips chunking and embedding entirely. |
-| **Within-run embed dedup** | Identical `embed_text` strings are embedded once per run, then reused for all matching chunk rows. Cross-run vector reuse is deliberately deferred. |
+| **Incremental document skip** | A change hash over raw text plus deterministic embedding context detects unchanged documents. Re-indexing an unchanged export skips chunking and embedding entirely. |
+| **Embed dedup and reuse** | Identical `embed_text` strings are embedded once per run; stored vectors are reused across runs by `(content_hash, embed_model)` when part of a changed document remains unchanged. |
 | **Extensible content types** | `content_type` is `TEXT`, not a Postgres enum. New types are new strings + JSONB metadata keys; no `ALTER TYPE` migration. |
 | **Hybrid-ready, not hybrid yet** | Chunks have generated `fts` and a GIN index for Layer 3 hybrid retrieval, but Layer 2 only ships a small cosine search helper. |
 
@@ -121,10 +122,10 @@ Layer 2 only provisions the storage/search seam that makes those cheap to add la
 | Column | Contains | Purpose |
 |---|---|---|
 | `documents.text` | full original authored text | citation/source display |
-| `documents.content_hash` | `sha256(documents.text)` | document-level change detection |
+| `documents.content_hash` | `sha256(text + platform + type + date + enrichment context)` | document-level change detection without stale embedding context |
 | `chunks.text` | raw chunk slice | matched passage display + FTS source |
 | `chunks.embed_text` | deterministic context prefix + raw chunk | passage embedding input |
-| `chunks.content_hash` | `sha256(chunks.embed_text)` | within-run embed dedup key |
+| `chunks.content_hash` | `sha256(chunks.embed_text)` | within-run dedup and same-model cross-run vector reuse key |
 | `chunks.fts` | generated `tsvector` from raw chunk text | Layer 3 lexical/hybrid search |
 | `chunks.embedding` | `vector(384)` from BGE | semantic search |
 
@@ -159,6 +160,7 @@ class IndexReport:
     documents_unchanged_skipped: int
     chunks_inserted: int
     chunks_embedded: int
+    chunks_reused_cross_run: int
     chunks_dedup_within_run: int
     embed_batches: int
     duration_s: float
@@ -181,8 +183,8 @@ Named tradeoffs:
   rate-limit-free.
 - Token counting uses a deterministic `words × 1.3` estimate instead of the model tokenizer, so
   pure tests do not download the model and chunk boundaries stay stable.
-- Layer 2 holds pending chunks in memory. At 10k chunks, 384-dim vectors are small enough for this
-  layer; streaming parse and stress/RSS measurements are Layer 4.
+- The pipeline holds pending chunks and Python `list[float]` vectors in memory to preserve batch
+  efficiency. Controlled 10k-chunk RSS measurement remains deferred.
 
 ---
 
@@ -278,6 +280,87 @@ Named tradeoff: low `chat_temperature` favors grounded fidelity over creative ph
 
 ---
 
+## Layer 4 — Efficiency
+
+Most of the main efficiency levers were already paid for in Layers 1–2: batched local embedding,
+within-run embedding deduplication, unchanged-document skips, and idempotent upserts. Layer 4 adds the
+remaining implementation mechanisms while deliberately deferring the controlled stress harness and
+10k-chunk benchmark.
+
+| Mechanism | Status | Effect |
+|---|---|---|
+| Batch embedding | ✅ Shipped earlier | Embeds unique passage inputs in batches of 64. |
+| Within-run embedding deduplication | ✅ Shipped earlier | Embeds identical `embed_text` once per run. |
+| Document-level incremental skip | ✅ Shipped earlier, corrected in Layer 4 | Unchanged documents skip chunking and embedding; the change hash now includes enrichment context. |
+| Streaming Twitter row parsing | ✅ Layer 4 | Avoids materializing the raw tweet file and its full decoded row list simultaneously. |
+| Single-transaction writes | ✅ Layer 4 | Removes one database commit per changed document while keeping `executemany` chunk inserts. |
+| Same-model cross-run vector reuse | ✅ Layer 4 | Reuses unchanged chunk vectors from changed documents by `(content_hash, embed_model)`. |
+| Controlled 5/25/50 MB and ~10k-chunk proof | ⏸ Deferred | No large-scale throughput or flat-RSS claim is made yet. |
+
+`IndexReport.chunks_embedded` and `chunks_reused_cross_run` count distinct embedding inputs;
+`chunks_inserted` counts stored chunk rows.
+
+### Memory model
+
+Streaming removes the raw tweet file and full parsed-row list from the parser's retained state.
+Memory is still `O(unique valid tweet ids) + O(authored content)`, because the parser keeps the
+deduplication id set and authored records needed for thread stitching. It is therefore **not**
+constant-memory, but noise content is processed and discarded instead of accumulated.
+
+The embedding/write phase still holds pending chunks and vectors in memory to preserve batch
+efficiency. `SentenceTransformerEmbedder` returns Python `list[float]` vectors, so their in-memory
+cost is materially larger than the compact `float32` wire/disk representation. The projected
+10k-chunk RSS cost and flat-memory behavior across controlled large tweet files remain unmeasured
+until the deferred stress harness is built.
+
+A real June 2026 Twitter export was audited as compatibility evidence: the complete archive was
+48.7 MB, but the parser-relevant account/profile/tweet files totaled only 72,964 bytes. It parsed in
+about 0.03 seconds with approximately 22.5 MB peak process RSS and produced 21 kept items. This
+validates real-export compatibility, **not** 50 MB tweet-file scalability.
+
+### Concurrency decisions
+
+Concurrency was considered and intentionally not added:
+
+- **Parallel embedding via multiprocessing: deferred.** Torch already uses intra-op CPU parallelism
+  during model inference. Extra processes would each load another model copy, trading substantial
+  memory and operational complexity for an unmeasured throughput gain.
+- **Embedding/write pipeline overlap: deferred.** A producer/consumer pipeline could overlap CPU
+  embedding with database I/O, but it complicates failure handling and transaction boundaries. Build
+  it only if the deferred benchmark shows database writes are material.
+- **Parallel file reads: not added.** The audited real export used one tweet file plus small
+  account/profile files; split tweet parts must preserve deterministic ordering, and there is no
+  evidence file I/O is the bottleneck.
+- **HNSW drop/rebuild during bulk seed: deferred.** It can improve very large initial loads, but
+  temporarily disables indexed search for concurrent readers and has not been shown to matter at the
+  current scale.
+
+### Named tradeoffs
+
+- **Local embeddings choose cost and operational control over maximum quality.**
+  `BAAI/bge-small-en-v1.5` is offline-after-download, rate-limit-free, and costs $0 per chunk, at a
+  likely quality cost versus larger hosted embedding models.
+- **Batch size 64 balances speed and memory.** Larger batches may improve throughput but increase
+  peak RAM; the shipped default is a middle ground.
+- **Streaming targets the unbounded raw-file buffer, not every in-memory structure.** Keeping ids
+  and authored content enables deterministic deduplication and thread stitching.
+- **Holding vectors until the write phase favors batch efficiency over minimum RAM.** Switching to
+  `float32` arrays plus batched writes is the next lever if measured RSS becomes a problem.
+- **One transaction plus `executemany` favors simplicity and atomicity over COPY throughput.** It
+  eliminates per-document commits without introducing pgvector COPY-format handling. The tradeoff is
+  a longer write transaction.
+- **Cross-run reuse is model-specific.** Reuse is valid only for the same `embed_model`; changing
+  models correctly forces re-embedding.
+- **Bio changes favor correctness over a cheap stale skip.** Because the bio enriches non-bio
+  passage embeddings, changing it intentionally reprocesses every dependent document.
+- **Concurrency favors clarity and memory over speculative speedups.** Multiprocessing, pipeline
+  overlap, and index rebuild optimizations remain gated on measured need.
+
+Layer 4's implementation mechanisms are shipped on the Twitter path, but the controlled stress proof
+and the full multi-source brief remain incomplete.
+
+---
+
 ## Getting started
 
 > **Prerequisites:** **Docker** (runs the database and backend) and **Node 18+** (frontend).
@@ -345,7 +428,7 @@ On the **first** `docker compose up`, auto-seed indexes the fixture and the API 
 index report:
 
 ```
-twitter: 58 changed (new 58, updated 0), 0 unchanged skipped, 60 chunks inserted, 60 chunks embedded (0 deduped), 1 embed batches in 1.518s
+twitter: 58 changed (new 58, updated 0), 0 unchanged skipped, 60 chunks inserted, 60 chunks embedded, 0 reused cross-run (0 deduped), 1 embed batches in 1.518s
 ```
 
 On every later `docker compose up`, the knowledge base already has rows, so seeding is skipped
@@ -401,12 +484,17 @@ embedding dedup, semantic search helper, and two-tier tests are implemented.
 citations, grounded prompt assembly, DeepSeek chat, FastAPI `/chat`, a minimal React UI, fake-LLM
 integration tests, and an optional live DeepSeek smoke test are implemented.
 
+**Layer 4 (efficiency) is partially shipped** — streaming Twitter parsing, one-transaction writes,
+same-model cross-run vector reuse, and enrichment-context invalidation are implemented and tested.
+The controlled 5/25/50 MB parse-memory proof and ~10k-chunk throughput/RSS benchmark are deferred.
+
 LinkedIn and Instagram parsers still follow on the Layer 1 seam. Layer 3 is platform-agnostic across
 whatever is in the store, but the full brief's multi-source requirement is not complete until those
 parsers land.
 
-> Known limitation: two Twitter classification rules (retweet & quote-tweet shape) are derived
-> from secondary sources and flagged for validation against a real export.
+> Known limitation: the retweet-shape classification rule is derived from secondary sources and
+> remains flagged for validation because the real June 2026 export used for parser auditing contained
+> no retweets. Quote-status link handling was validated against that export.
 
 > Known Layer 2 limitation: templated enrichment is the shipped zero-cost baseline. LLM enrichment
 > for short, context-poor posts is intentionally deferred; it is the likely answer-quality knob to

@@ -12,13 +12,33 @@ from cortex.chunking.enrich import author_blurb, build_embed_text
 from cortex.config import settings
 from cortex.embedding.embedder import SentenceTransformerEmbedder
 from cortex.ingestion import resolve
-from cortex.models import IndexReport
+from cortex.models import ContentItem, IndexReport
 from cortex.store.db import connect
-from cortex.store.repository import get_existing_hashes, replace_chunks, upsert_document
+from cortex.store.repository import (
+    get_existing_hashes,
+    get_reusable_vectors,
+    replace_chunks,
+    upsert_document,
+)
 
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def document_change_hash(item: ContentItem, blurb: str) -> str:
+    """Hash every cheap input that can change this document's embedding text."""
+    date = item.created_at.date().isoformat() if item.created_at else "undated"
+    context = "" if item.content_type == "bio" else blurb
+    return sha256_text(
+        "\x1f".join([
+            item.text,
+            item.source_platform,
+            item.content_type,
+            date,
+            context,
+        ])
+    )
 
 
 def unique_embed_texts(chunk_rows: list[dict]) -> list[str]:
@@ -90,7 +110,7 @@ def index_export(
     pending = []
     all_chunk_rows = []
     for item in items:
-        doc_hash = sha256_text(item.text)
+        doc_hash = document_change_hash(item, blurb)
         old_hash = existing.get(item.external_id)
         if old_hash == doc_hash:
             report.documents_unchanged_skipped += 1
@@ -122,20 +142,39 @@ def index_export(
         pending.append((item, doc_hash, chunk_rows))
 
     unique_texts = unique_embed_texts(all_chunk_rows)
-    vector_by_text, embed_batches, embed_duration_s = embed_unique_texts(
+    hash_by_text = {text: sha256_text(text) for text in unique_texts}
+    with conn.transaction():
+        reusable_vectors = get_reusable_vectors(
+            conn,
+            list(hash_by_text.values()),
+            embedder.model_id,
+        )
+
+    texts_to_embed = [
+        text for text in unique_texts
+        if hash_by_text[text] not in reusable_vectors
+    ]
+    embedded_vectors, embed_batches, embed_duration_s = embed_unique_texts(
         embedder,
-        unique_texts,
+        texts_to_embed,
         cfg.embed_batch_size,
     )
-    report.chunks_embedded = len(unique_texts)
+    vector_by_text = {
+        text: reusable_vectors[hash_by_text[text]]
+        for text in unique_texts
+        if hash_by_text[text] in reusable_vectors
+    }
+    vector_by_text.update(embedded_vectors)
+
+    report.chunks_embedded = len(texts_to_embed)
+    report.chunks_reused_cross_run = len(unique_texts) - len(texts_to_embed)
     report.chunks_dedup_within_run = len(all_chunk_rows) - len(unique_texts)
     report.embed_batches = embed_batches
     report.embed_duration_s = embed_duration_s
 
-    for item, doc_hash, chunk_rows in pending:
-        attach_embeddings(chunk_rows, vector_by_text)
-
-        with conn.transaction():
+    with conn.transaction():
+        for item, doc_hash, chunk_rows in pending:
+            attach_embeddings(chunk_rows, vector_by_text)
             document_id = upsert_document(conn, item, doc_hash)
             report.chunks_inserted += replace_chunks(conn, document_id, chunk_rows)
 

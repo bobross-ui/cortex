@@ -6,11 +6,14 @@ import shutil
 
 import pytest
 
+from cortex.chunking.chunker import chunk_text
+from cortex.chunking.enrich import author_blurb, build_embed_text
 from cortex.config import settings
 from cortex.embedding.embedder import Embedder, SentenceTransformerEmbedder
-from cortex.pipeline.index import index_export
+from cortex.ingestion.twitter import TwitterParser
+from cortex.pipeline.index import index_export, sha256_text
 from cortex.store.db import connect
-from cortex.store.repository import search
+from cortex.store.repository import get_reusable_vectors, search
 
 
 pytestmark = [
@@ -97,6 +100,7 @@ def test_index_pipeline_idempotency_update_dedup_and_semantic_search(
     assert first.documents_unchanged_skipped == 0
     assert first.chunks_inserted > first.documents_new
     assert first.chunks_embedded == len(set(counting.seen))
+    assert first.chunks_reused_cross_run == 0
     assert len(counting.seen) == len(set(counting.seen))
     assert first.chunks_dedup_within_run == first.chunks_inserted - first.chunks_embedded
 
@@ -117,6 +121,7 @@ def test_index_pipeline_idempotency_update_dedup_and_semantic_search(
     assert second.documents_unchanged_skipped == 58
     assert second.chunks_inserted == 0
     assert second.chunks_embedded == 0
+    assert second.chunks_reused_cross_run == 0
     assert second.embed_batches == 0
     assert counting.calls == calls_after_first
 
@@ -129,6 +134,7 @@ def test_index_pipeline_idempotency_update_dedup_and_semantic_search(
     assert updated.documents_unchanged_skipped == 57
     assert updated.chunks_inserted == 1
     assert updated.chunks_embedded == 1
+    assert updated.chunks_reused_cross_run == 0
     assert _chunk_count_for_document(conn, doc_id) == 1
     assert _table_count(conn, "chunks") == first.chunks_inserted
 
@@ -144,8 +150,74 @@ def test_index_pipeline_idempotency_update_dedup_and_semantic_search(
 
     assert dedup.chunks_inserted == first.chunks_inserted
     assert dedup.chunks_embedded == 1
+    assert dedup.chunks_reused_cross_run == 0
     assert dedup.chunks_dedup_within_run == first.chunks_inserted - 1
     assert dedup_counting.seen == ["constant embedding input"]
+
+
+def test_changed_multichunk_document_reuses_unchanged_vectors(
+    tmp_path,
+    conn,
+    real_embedder,
+):
+    _reset_db(conn)
+    first = index_export(FIX, conn, embedder=real_embedder, cfg=settings)
+    before = _chunk_vectors_by_hash(conn, "2300")
+    with conn.transaction():
+        wrong_model_reuse = get_reusable_vectors(conn, list(before), "different-model")
+
+    mutated_root = _mutated_thread_fixture(tmp_path)
+    run_two_hashes = _computed_chunk_hashes(mutated_root, "2300")
+    reusable_hashes = run_two_hashes & before.keys()
+    new_hashes = run_two_hashes - before.keys()
+
+    assert reusable_hashes
+    assert new_hashes
+
+    counting = CountingEmbedder(real_embedder)
+    updated = index_export(mutated_root, conn, embedder=counting, cfg=settings)
+    after = _chunk_vectors_by_hash(conn, "2300")
+
+    assert first.chunks_reused_cross_run == 0
+    assert wrong_model_reuse == {}
+    assert updated.documents_updated == 1
+    assert updated.documents_unchanged_skipped == 57
+    assert updated.chunks_embedded == len(new_hashes)
+    assert updated.chunks_reused_cross_run == len(reusable_hashes)
+    assert updated.chunks_embedded + updated.chunks_reused_cross_run == len(run_two_hashes)
+    assert set(counting.seen) == _embed_texts_for_hashes(mutated_root, "2300", new_hashes)
+    for content_hash in reusable_hashes:
+        assert list(after[content_hash]) == list(before[content_hash])
+
+
+def test_enrichment_context_change_invalidates_dependent_documents(
+    tmp_path,
+    conn,
+    real_embedder,
+):
+    _reset_db(conn)
+    first = index_export(FIX, conn, embedder=real_embedder, cfg=settings)
+
+    bio_root = _mutated_bio_fixture(tmp_path)
+    bio_updated = index_export(bio_root, conn, embedder=real_embedder, cfg=settings)
+
+    assert bio_updated.documents_updated == first.documents_new
+    assert bio_updated.documents_unchanged_skipped == 0
+    assert bio_updated.chunks_inserted == first.chunks_inserted
+    assert bio_updated.chunks_embedded == first.chunks_embedded
+    assert bio_updated.chunks_reused_cross_run == 0
+
+    _reset_db(conn)
+    index_export(FIX, conn, embedder=real_embedder, cfg=settings)
+
+    post_root = _mutated_fixture(tmp_path)
+    post_updated = index_export(post_root, conn, embedder=real_embedder, cfg=settings)
+
+    assert post_updated.documents_updated == 1
+    assert post_updated.documents_unchanged_skipped == 57
+    assert post_updated.chunks_inserted == 1
+    assert post_updated.chunks_embedded == 1
+    assert post_updated.chunks_reused_cross_run == 0
 
 
 def _reset_db(conn):
@@ -203,6 +275,41 @@ def _chunk_count_for_document(conn, document_id: int) -> int:
         return cur.fetchone()[0]
 
 
+def _chunk_vectors_by_hash(conn, external_id: str) -> dict[str, object]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT chunks.content_hash, chunks.embedding
+            FROM chunks
+            JOIN documents ON documents.id = chunks.document_id
+            WHERE documents.source_platform = 'twitter'
+              AND documents.external_id = %s
+            """,
+            (external_id,),
+        )
+        return {content_hash: embedding for content_hash, embedding in cur.fetchall()}
+
+
+def _embed_texts_by_hash(root: Path, external_id: str) -> dict[str, str]:
+    items = list(TwitterParser().parse(root))
+    blurb = author_blurb(items)
+    item = next(item for item in items if item.external_id == external_id)
+    by_hash = {}
+    for chunk in chunk_text(item.text, settings):
+        embed_text = build_embed_text(item, chunk.text, blurb)
+        by_hash[sha256_text(embed_text)] = embed_text
+    return by_hash
+
+
+def _computed_chunk_hashes(root: Path, external_id: str) -> set[str]:
+    return set(_embed_texts_by_hash(root, external_id))
+
+
+def _embed_texts_for_hashes(root: Path, external_id: str, hashes: set[str]) -> set[str]:
+    by_hash = _embed_texts_by_hash(root, external_id)
+    return {by_hash[content_hash] for content_hash in hashes}
+
+
 def _mutated_fixture(tmp_path) -> Path:
     root = tmp_path / "twitter"
     shutil.copytree(FIX, root)
@@ -218,4 +325,35 @@ def _mutated_fixture(tmp_path) -> Path:
         raise AssertionError("fixture tweet 1004 not found")
 
     tweets_path.write_text(prefix + json.dumps(rows, indent=2), encoding="utf-8")
+    return root
+
+
+def _mutated_thread_fixture(tmp_path) -> Path:
+    root = tmp_path / "twitter-thread"
+    shutil.copytree(FIX, root)
+    tweets_path = root / "data" / "tweets.js"
+    prefix = "window.YTD.tweets.part0 = "
+    rows = json.loads(tweets_path.read_text(encoding="utf-8").removeprefix(prefix))
+    for row in rows:
+        tweet = row.get("tweet", {})
+        if tweet.get("id_str") == "2301":
+            tweet["full_text"] = tweet["full_text"].replace("trillions", "billions")
+            break
+    else:
+        raise AssertionError("fixture thread member 2301 not found")
+
+    tweets_path.write_text(prefix + json.dumps(rows, indent=2), encoding="utf-8")
+    return root
+
+
+def _mutated_bio_fixture(tmp_path) -> Path:
+    root = tmp_path / "twitter-bio"
+    shutil.copytree(FIX, root)
+    profile_path = root / "data" / "profile.js"
+    prefix = "window.YTD.profile.part0 = "
+    rows = json.loads(profile_path.read_text(encoding="utf-8").removeprefix(prefix))
+    rows[0]["profile"]["description"]["bio"] = (
+        "Engineer. Writing about durable systems and focused work. Opinions my own."
+    )
+    profile_path.write_text(prefix + json.dumps(rows, indent=2), encoding="utf-8")
     return root

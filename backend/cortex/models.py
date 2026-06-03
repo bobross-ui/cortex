@@ -47,6 +47,7 @@ class IndexReport:
     documents_unchanged_skipped: int = 0
     chunks_inserted: int = 0
     chunks_embedded: int = 0
+    chunks_reused_cross_run: int = 0
     chunks_dedup_within_run: int = 0
     embed_batches: int = 0
     duration_s: float = 0.0
@@ -64,7 +65,8 @@ class IndexReport:
             f"(new {self.documents_new}, updated {self.documents_updated}), "
             f"{self.documents_unchanged_skipped} unchanged skipped, "
             f"{self.chunks_inserted} chunks inserted, "
-            f"{self.chunks_embedded} chunks embedded "
+            f"{self.chunks_embedded} chunks embedded, "
+            f"{self.chunks_reused_cross_run} reused cross-run "
             f"({self.chunks_dedup_within_run} deduped), "
             f"{self.embed_batches} embed batches in {self.duration_s:.3f}s"
         )
