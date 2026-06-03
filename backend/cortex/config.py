@@ -35,5 +35,10 @@ class Settings(BaseSettings):
     rrf_k: int = 60
     chat_context_char_cap: int = 6000
 
+    # Local-run convenience: on API startup, index the bundled export once if the
+    # knowledge base is empty so `docker compose up` is the only command needed.
+    auto_seed: bool = True
+    seed_export_dir: str = "tests/fixtures/twitter"
+
 
 settings = Settings()

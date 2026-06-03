@@ -280,70 +280,76 @@ Named tradeoff: low `chat_temperature` favors grounded fidelity over creative ph
 
 ## Getting started
 
-> **Prerequisite:** Python **3.11+**. (A fresh virtualenv is recommended: `python3.11 -m venv .venv && source .venv/bin/activate`.)
+> **Prerequisites:** **Docker** (runs the database and backend) and **Node 18+** (frontend).
+> Python **3.11+** is only needed to run the test suite on the host.
 
 ```bash
-# install (editable, with dev/test extras)
-pip install -e ".[dev]"
+# optional: add a DeepSeek API key for generated answers
+# (retrieval + cited sources work without it; chat returns 503 until a key is set)
+cp .env.example .env        # then edit DEEPSEEK_API_KEY=...
 
-# ingest the bundled Twitter fixture and print the ingestion report
-python -m cortex.pipeline.ingest tests/fixtures/twitter
-
-# start Postgres + pgvector
-docker compose up -d postgres
-
-# index the bundled Twitter fixture into the vector knowledge base
-DATABASE_URL=postgresql://cortex:cortex@localhost:5432/cortex \
-  python -m cortex.pipeline.index tests/fixtures/twitter
-
-# re-run to verify incremental skip
-DATABASE_URL=postgresql://cortex:cortex@localhost:5432/cortex \
-  python -m cortex.pipeline.index tests/fixtures/twitter
-
-# run the pure test tier (no DB, no model download)
-pytest -m "not integration and not live"
-
-# run the integration tier (real pgvector + real BGE model; LLM faked)
-DATABASE_URL=postgresql://cortex:cortex@localhost:5432/cortex pytest -m "integration and not live"
-
-# optional: run the live DeepSeek smoke test (requires DEEPSEEK_API_KEY in .env)
-pytest -m live
-
-# run the retrieval eval that decides the hybrid default
-DATABASE_URL=postgresql://cortex:cortex@localhost:5432/cortex python eval/retrieval_eval.py
-
-# start the API
-DATABASE_URL=postgresql://cortex:cortex@localhost:5432/cortex uvicorn cortex.api.main:app
+# start Postgres + the API together
+docker compose up
 
 # start the React UI in another shell
 cd frontend
 npm install
 npm run dev
 
-# stop Postgres when done
+# stop everything when done (indexed data persists in the pgdata volume)
 docker compose down
 ```
 
-The first index or integration run may download and cache the BGE model from Hugging Face. Later
-runs reuse the local cache.
+Then open the URL Vite prints (typically <http://localhost:5173>); it proxies `/chat` and `/health`
+to the API on `http://localhost:8000`.
 
-Ingesting the fixture prints a one-line summary plus a JSON report, e.g.:
+The **first** `docker compose up` is the only slow run: it builds the backend image, downloads the
+BGE model into the `hfcache` volume, and indexes the bundled Twitter fixture once (auto-seed). Every
+later run reuses the cached image, the cached model, and the persisted vectors — embedding does
+**not** run again. Changed dependencies need a one-time `docker compose up --build`; to wipe the
+indexed data and re-seed from scratch, use `docker compose down -v`.
+
+### Testing
+
+Tests run on the host against the Postgres started by `docker compose up`.
+
+> **Heads-up:** the integration tier `TRUNCATE`s the `chunks`/`documents` tables, so it wipes the
+> auto-seeded demo data. Run `docker compose restart api` afterward to re-seed.
+
+```bash
+pip install -e ".[dev]"     # package + test extras (downloads the BGE model on first integration run)
+
+# pure tier — no DB, no model download
+pytest -m "not integration and not live"
+
+# integration tier — real pgvector + real BGE model (LLM faked)
+pytest -m "integration and not live"
+
+# optional: live DeepSeek smoke test (requires DEEPSEEK_API_KEY in .env)
+pytest -m live
+
+# retrieval eval that decides the hybrid default
+python eval/retrieval_eval.py
+
+# optional: inspect Layer 1 ingestion only (no DB, prints the ingestion report)
+python -m cortex.pipeline.ingest tests/fixtures/twitter
+```
+
+The optional ingest command prints a one-line summary plus a JSON report, e.g.:
 
 ```
 twitter: 58 kept (bio 1, post 51, thread 6), 24 dropped (reply_to_other 13, retweet 11), 7 skipped (malformed 2, empty 5) in 0.002s
 ```
 
-Indexing the fixture prints a one-line summary plus a JSON report, e.g.:
+On the **first** `docker compose up`, auto-seed indexes the fixture and the API logs the same kind of
+index report:
 
 ```
 twitter: 58 changed (new 58, updated 0), 0 unchanged skipped, 60 chunks inserted, 60 chunks embedded (0 deduped), 1 embed batches in 1.518s
 ```
 
-Re-indexing the unchanged fixture prints:
-
-```
-twitter: 0 changed (new 0, updated 0), 58 unchanged skipped, 0 chunks inserted, 0 chunks embedded (0 deduped), 0 embed batches in 0.006s
-```
+On every later `docker compose up`, the knowledge base already has rows, so seeding is skipped
+entirely — no model embedding work runs.
 
 ---
 
@@ -353,7 +359,9 @@ twitter: 0 changed (new 0, updated 0), 58 unchanged skipped, 0 chunks inserted, 
 cortex/
 ├── README.md
 ├── pyproject.toml
-├── docker-compose.yml
+├── Dockerfile                 # backend image for `docker compose up`
+├── docker-compose.yml         # Postgres + API, with persisted volumes
+├── .dockerignore
 ├── .env.example
 ├── .github/workflows/ci.yml
 ├── backend/cortex/

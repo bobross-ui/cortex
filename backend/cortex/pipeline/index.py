@@ -143,6 +143,27 @@ def index_export(
     return report
 
 
+def chunk_count(conn) -> int:
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM chunks")
+        return int(cur.fetchone()[0])
+
+
+def seed_if_empty(conn, embedder, cfg=settings) -> IndexReport | None:
+    """Index the bundled export once if the chunks table is empty.
+
+    Keeps `docker compose up` a single command: the first boot seeds the
+    knowledge base, later boots find persisted rows and skip embedding entirely.
+    Returns the IndexReport when seeding ran, or None when it was skipped.
+    """
+    if chunk_count(conn) > 0:
+        return None
+    export_dir = Path(cfg.seed_export_dir)
+    if not export_dir.exists():
+        return None
+    return index_export(export_dir, conn, embedder=embedder, cfg=cfg)
+
+
 def main(argv=None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     if not argv:

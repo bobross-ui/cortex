@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from cortex.config import settings
 from cortex.embedding.embedder import SentenceTransformerEmbedder
+from cortex.pipeline.index import seed_if_empty
 from cortex.rag.chat import DeepSeekChatClient
 from cortex.rag.prompt import build_messages, cited_indices
 from cortex.rag.retriever import Source, retrieve
@@ -83,6 +84,14 @@ async def lifespan(app: FastAPI):
         if settings.deepseek_api_key
         else None
     )
+    if settings.auto_seed:
+        try:
+            with app.state.pool.connection() as conn:
+                report = seed_if_empty(conn, app.state.embedder, settings)
+            if report is not None:
+                print(report.human_summary(), flush=True)
+        except Exception as exc:  # best-effort: the API can still serve an empty KB
+            print(f"auto-seed skipped: {exc}", flush=True)
     try:
         yield
     finally:

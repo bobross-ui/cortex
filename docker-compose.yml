@@ -7,8 +7,29 @@ services:
       POSTGRES_DB: cortex
     ports:
       - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U cortex -d cortex"]
       interval: 5s
       timeout: 5s
       retries: 10
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Reach Postgres by service name; overrides any localhost value in .env.
+      DATABASE_URL: postgresql://cortex:cortex@postgres:5432/cortex
+      HF_HOME: /hf
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app        # live source, bundled fixture, and .env (for DEEPSEEK_API_KEY)
+      - hfcache:/hf   # BGE model cache: downloaded once, reused every run
+
+volumes:
+  pgdata:
+  hfcache:
