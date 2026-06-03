@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging/build outputs
+*.egg-info/
+build/
+dist/
+
+# OS/editor files
+.DS_Store
+.claude/
+.idea/
+.vscode/
+
+# Markdown docs: ignore all except README files.
+*.md
+!README.md
+!readme.md
+!**/README.md
+!**/readme.md
