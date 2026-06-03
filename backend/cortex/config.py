@@ -18,5 +18,22 @@ class Settings(BaseSettings):
     # Layer 3 query-side use only. Do not prepend this to passages in Layer 2.
     bge_query_instruction: str = "Represent this sentence for searching relevant passages:"
 
+    # Layer 3: chat (RAG).
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-v4-flash"
+    deepseek_disable_thinking: bool = True
+    chat_temperature: float = 0.2
+    chat_max_tokens: int = 800
+    chat_timeout_s: float = 60.0
+    chat_max_retries: int = 2
+
+    retrieval_k: int = 6
+    retrieval_candidates: int = 20
+    retrieval_hybrid: bool = True
+    rrf_candidates: int = 50
+    rrf_k: int = 60
+    chat_context_char_cap: int = 6000
+
 
 settings = Settings()

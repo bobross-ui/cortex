@@ -4,22 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cortex"
-version = "0.2.0"
+version = "0.3.0"
 requires-python = ">=3.11"
 dependencies = [
   "sentence-transformers>=3,<6",
   "psycopg[binary]>=3.1",
+  "psycopg-pool>=3.2",
   "pgvector>=0.3",
   "numpy>=1.26",
   "pydantic-settings>=2",
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "openai>=1.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "httpx>=0.27"]
 
 [tool.setuptools.packages.find]
 where = ["backend"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: needs real Postgres+pgvector and the bge model (run in CI)"]
+markers = [
+  "integration: needs real Postgres+pgvector and the bge model (run in CI)",
+  "live: needs a real external LLM API key and network",
+]

@@ -14,10 +14,17 @@ htmlcov/
 venv/
 env/
 
+# Local environment files
+.env
+.env.*
+!.env.example
+
 # Packaging/build outputs
 *.egg-info/
 build/
 dist/
+node_modules/
+frontend/dist/
 
 # OS/editor files
 .DS_Store

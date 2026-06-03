@@ -160,6 +160,63 @@ def search(
         return list(cur.fetchall())
 
 
+def fetch_documents(conn, document_ids: Sequence[int]) -> dict[int, dict]:
+    """Map document_id to document fields needed for the Layer 3 citation join."""
+    if not document_ids:
+        return {}
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT id, source_platform, external_id, content_type, author_handle,
+                   url, text, created_at, metadata
+            FROM documents
+            WHERE id = ANY(%s)
+            """,
+            (list(document_ids),),
+        )
+        return {row["id"]: row for row in cur.fetchall()}
+
+
+def search_fts(
+    conn,
+    query_text: str,
+    k: int = 20,
+    *,
+    source_platform: str | None = None,
+    content_type: str | None = None,
+) -> list[dict]:
+    """Lexical candidates for hybrid retrieval using generated chunks.fts rankings."""
+    clauses = ["fts @@ websearch_to_tsquery('english', %s)"]
+    filter_params = []
+
+    if source_platform is not None:
+        clauses.append("source_platform = %s")
+        filter_params.append(source_platform)
+    if content_type is not None:
+        clauses.append("content_type = %s")
+        filter_params.append(content_type)
+
+    where = " AND ".join(clauses)
+    # Placeholder order follows the SQL text: SELECT rank query, WHERE query,
+    # optional filters, then LIMIT.
+    params = [query_text, query_text, *filter_params, k]
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            f"""
+            SELECT id, document_id, chunk_index, text, source_platform, content_type,
+                   created_at, metadata,
+                   ts_rank(fts, websearch_to_tsquery('english', %s)) AS rank
+            FROM chunks
+            WHERE {where}
+            ORDER BY rank DESC
+            LIMIT %s
+            """,
+            params,
+        )
+        return list(cur.fetchall())
+
+
 def _adapt_embedding(embedding):
     if embedding is None or isinstance(embedding, Vector):
         return embedding

@@ -3,7 +3,7 @@
 > **Social Data → Vector Knowledge Base → Grounded Chat.** A personal RAG system that turns your
 > social-media exports into a searchable, citable knowledge base you can ask questions of.
 
-![status](https://img.shields.io/badge/status-Layer%202%20shipped-brightgreen)
+![status](https://img.shields.io/badge/status-Layer%203%20shipped-brightgreen)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![tests](https://img.shields.io/badge/tests-pytest-green)
 
@@ -31,14 +31,14 @@ An end-to-end system built across four layers, each of which matters:
 
 ## Roadmap
 
-This README grows one layer at a time. **Layers 1–2** are detailed below; later sections are added
+This README grows one layer at a time. **Layers 1–3** are detailed below; later sections are added
 as each layer lands.
 
 | Layer | Scope | Status |
 |---|---|---|
 | **1 — Ingestion** | Pluggable parsers; authored-content extraction; Twitter first | ✅ **Shipped** |
 | **2 — Vector KB** | Structure-aware chunking, local embeddings, pgvector schema | ✅ **Shipped** |
-| 3 — Chat (RAG) | Retrieval, grounded prompt, cited answers, UI | ⚪ Planned |
+| **3 — Chat (RAG)** | Retrieval, grounded prompt, cited answers, UI | ✅ **Shipped** |
 | 4 — Efficiency | Streaming parse, multiprocessing/stress numbers, RSS measurement | ⚪ Planned |
 
 ---
@@ -186,6 +186,98 @@ Named tradeoffs:
 
 ---
 
+## Layer 3 — Chat (RAG)
+
+Layer 3 turns the Layer 2 store into a single-turn grounded chat path:
+query embedding → retrieval → citation join → grounded prompt → DeepSeek → cited answer → React UI.
+
+### Key decisions
+
+| Decision | What & why |
+|---|---|
+| **Single-turn chat** | `/chat` answers one question at a time. Conversation history, query rewriting, reranking, and MMR are deferred to keep the vertical slice reliable. |
+| **BGE query instruction only on queries** | Passage embeddings stay exactly as Layer 2 wrote them. Query embeddings prepend `Represent this sentence for searching relevant passages:` to match BGE's retrieval guidance. |
+| **Citation join is document-level** | Retrieval starts from chunks, then joins back to `documents` for `url`, `external_id`, `author_handle`, and full source text. Multiple chunks from one document collapse to one source. |
+| **Bounded document context** | The LLM gets full document text when it is under `chat_context_char_cap` and falls back to the matched chunk for long documents. The UI shows the matched chunk as the snippet. |
+| **DeepSeek via OpenAI SDK** | `DeepSeekChatClient` uses the OpenAI-compatible API at `https://api.deepseek.com`, model `deepseek-v4-flash`, with thinking disabled for grounded low-temperature RAG. |
+| **Citations are enforced** | If sources exist and the first answer has no valid `[n]` markers, the API retries once with an explicit citation nudge. The response includes `grounded` and per-source `cited` flags. |
+| **Streaming UI** | `/chat/stream` streams answer tokens with server-sent events, then sends final cited sources after the complete answer is available for citation parsing. |
+| **Hybrid default** | Semantic KNN and Postgres FTS are fused with Reciprocal Rank Fusion. Hybrid is enabled by default because it did not regress on the fixture and should provide better lexical coverage on real exports. |
+
+### API contract
+
+`POST /chat` returns a complete JSON response. `POST /chat/stream` accepts the same request body and
+returns `text/event-stream`: `token` events while the model writes, then a final `sources` event with
+the same response schema fields, followed by `done`. The non-streaming endpoint retries once if the
+model cites nothing; the streaming endpoint cannot retract already-sent text, so it reports the final
+`grounded` flag honestly.
+
+```json
+{
+  "question": "What does this person think about remote work?",
+  "filters": { "source_platform": "twitter", "content_type": "thread" }
+}
+```
+
+Streaming event example:
+
+```text
+event: token
+data: {"text":"They value async communication"}
+
+event: sources
+data: {"answer":"They value async communication [2].","sources":[...],"abstained":false,"grounded":true}
+
+event: done
+data: {}
+```
+
+Response:
+
+```json
+{
+  "answer": "They value async communication for deep work [2].",
+  "sources": [
+    {
+      "index": 2,
+      "external_id": "1001",
+      "platform": "twitter",
+      "content_type": "thread",
+      "url": "https://twitter.com/cortex_demo/status/1001",
+      "author_handle": "cortex_demo",
+      "date": "2024-05-15",
+      "snippet": "Some hard-won thoughts on remote work, a thread...",
+      "score": 0.7309,
+      "cited": true
+    }
+  ],
+  "abstained": false,
+  "grounded": true
+}
+```
+
+### Retrieval eval
+
+The bundled eval in `eval/gold_set.py` / `eval/retrieval_eval.py` is a **sanity check**, not a
+benchmark. It verifies that semantic-only and hybrid retrieval both find the expected documents. The
+fixture is too small and too clean to demonstrate a hybrid quality lift, but hybrid did not regress
+the measured fixture, so `retrieval_hybrid=True` is the default for better lexical coverage on real
+exports.
+
+| Query class | What happened | Implication |
+|---|---|---|
+| Paraphrase questions | FTS usually returned no rows because `websearch_to_tsquery` over the full question is strict on unmatched terms. | Hybrid mostly collapsed to semantic-only. |
+| Exact-token questions | Semantic already ranked every expected lexical target at `#1`. | Hybrid had no measurable room to improve on this fixture. |
+| Hardest semantic query | `how do interruptions affect deep focus?` ranked expected source `2400` at `#4` in both modes. | Hybrid did not fix semantic misses without useful lexical overlap. |
+
+A stronger real-export eval should include lexical-hard queries where semantic does not already rank
+the target first, rare handles/product names/hashtags, and query preprocessing for FTS before making
+quality claims from the numbers.
+
+Named tradeoff: low `chat_temperature` favors grounded fidelity over creative phrasing.
+
+---
+
 ## Getting started
 
 > **Prerequisite:** Python **3.11+**. (A fresh virtualenv is recommended: `python3.11 -m venv .venv && source .venv/bin/activate`.)
@@ -209,10 +301,24 @@ DATABASE_URL=postgresql://cortex:cortex@localhost:5432/cortex \
   python -m cortex.pipeline.index tests/fixtures/twitter
 
 # run the pure test tier (no DB, no model download)
-pytest -m "not integration"
+pytest -m "not integration and not live"
 
-# run the integration tier (real pgvector + real BGE model)
-DATABASE_URL=postgresql://cortex:cortex@localhost:5432/cortex pytest -m integration
+# run the integration tier (real pgvector + real BGE model; LLM faked)
+DATABASE_URL=postgresql://cortex:cortex@localhost:5432/cortex pytest -m "integration and not live"
+
+# optional: run the live DeepSeek smoke test (requires DEEPSEEK_API_KEY in .env)
+pytest -m live
+
+# run the retrieval eval that decides the hybrid default
+DATABASE_URL=postgresql://cortex:cortex@localhost:5432/cortex python eval/retrieval_eval.py
+
+# start the API
+DATABASE_URL=postgresql://cortex:cortex@localhost:5432/cortex uvicorn cortex.api.main:app
+
+# start the React UI in another shell
+cd frontend
+npm install
+npm run dev
 
 # stop Postgres when done
 docker compose down
@@ -256,8 +362,12 @@ cortex/
 │   ├── chunking/              # structure-aware chunker + embed_text enrichment
 │   ├── embedding/             # Embedder ABC + SentenceTransformerEmbedder
 │   ├── ingestion/             # base ABC, registry, normalize, twitter parser
+│   ├── rag/                   # retriever, grounded prompt, DeepSeek chat client
+│   ├── api/                   # FastAPI /health and /chat
 │   ├── store/                 # schema.sql, db connection, repository helpers
 │   └── pipeline/              # ingest.py (Layer 1), index.py (Layer 2)
+├── eval/                      # retrieval gold set + semantic-vs-hybrid eval
+├── frontend/                  # Vite + React chat page
 └── tests/
     ├── fixtures/twitter/      # synthetic test archive
     ├── test_chunker.py
@@ -279,8 +389,13 @@ fixture.
 enrichment, local BGE embeddings, Postgres + pgvector schema, incremental upsert, within-run
 embedding dedup, semantic search helper, and two-tier tests are implemented.
 
-LinkedIn and Instagram parsers follow on the Layer 1 seam. Chat/RAG retrieval and UI follow on
-the Layer 2 store/search seam. This README will be extended as Layers 3–4 land.
+**Layer 3 (chat/RAG) is shipped** — semantic retrieval, optional hybrid RRF retrieval, document-level
+citations, grounded prompt assembly, DeepSeek chat, FastAPI `/chat`, a minimal React UI, fake-LLM
+integration tests, and an optional live DeepSeek smoke test are implemented.
+
+LinkedIn and Instagram parsers still follow on the Layer 1 seam. Layer 3 is platform-agnostic across
+whatever is in the store, but the full brief's multi-source requirement is not complete until those
+parsers land.
 
 > Known limitation: two Twitter classification rules (retweet & quote-tweet shape) are derived
 > from secondary sources and flagged for validation against a real export.
