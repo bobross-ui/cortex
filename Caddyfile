@@ -1,0 +1,8 @@
+# Caddy fronts the API with automatic HTTPS.
+# CORTEX_DOMAIN must be a real domain whose DNS A record points at this host;
+# Caddy provisions and renews a Let's Encrypt certificate for it automatically.
+{$CORTEX_DOMAIN} {
+	# reverse_proxy streams SSE (text/event-stream) without buffering, so the
+	# /chat/stream endpoint works through the proxy.
+	reverse_proxy api:8000
+}

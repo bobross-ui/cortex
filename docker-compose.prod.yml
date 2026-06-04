@@ -1,0 +1,33 @@
+# Production overlay for a public EC2 host.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# Adds a Caddy reverse proxy that terminates TLS (automatic Let's Encrypt
+# certificate for $CORTEX_DOMAIN) and forwards to the API over the internal
+# compose network. Caddy streams text/event-stream responses without buffering,
+# so /chat/stream (SSE) works through it. Set CORTEX_DOMAIN in .env.
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CORTEX_DOMAIN: ${CORTEX_DOMAIN:?set CORTEX_DOMAIN in .env, e.g. api.example.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  api:
+    restart: unless-stopped
+
+  postgres:
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

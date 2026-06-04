@@ -40,5 +40,18 @@ class Settings(BaseSettings):
     auto_seed: bool = True
     seed_export_dir: str = "tests/fixtures/twitter"
 
+    # Deployment: browser origins allowed to call the API (comma-separated).
+    # "*" allows any origin — acceptable for this public, cookieless read API.
+    # In production set it to the deployed frontend URL, e.g.
+    # CORS_ALLOW_ORIGINS=https://your-app.vercel.app
+    cors_allow_origins: str = "*"
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        raw = self.cors_allow_origins.strip()
+        if raw in ("", "*"):
+            return ["*"]
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
 
 settings = Settings()

@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 import json
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pgvector.psycopg import register_vector
 from psycopg_pool import ConnectionPool
@@ -100,6 +101,17 @@ async def lifespan(app: FastAPI):
 
 def create_app(lifespan_context=lifespan) -> FastAPI:
     api = FastAPI(lifespan=lifespan_context)
+
+    # Allow the browser frontend (served from a different origin in production,
+    # e.g. Vercel) to call this API. No cookies/credentials are used, so a
+    # wildcard origin is safe by default; narrow it with CORS_ALLOW_ORIGINS.
+    api.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins_list,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     @api.get("/health")
     def health(request: Request) -> dict[str, str]:

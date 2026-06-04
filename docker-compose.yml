@@ -6,7 +6,8 @@ services:
       POSTGRES_PASSWORD: cortex
       POSTGRES_DB: cortex
     ports:
-      - "5432:5432"
+      # Bind to localhost only: reachable for host-run tests, never the internet.
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -25,7 +26,9 @@ services:
       DATABASE_URL: postgresql://cortex:cortex@postgres:5432/cortex
       HF_HOME: /hf
     ports:
-      - "8000:8000"
+      # Bind to localhost only. Locally the Vite dev proxy reaches it here; in
+      # production Caddy reaches it over the compose network (see docker-compose.prod.yml).
+      - "127.0.0.1:8000:8000"
     volumes:
       - .:/app        # live source, bundled fixture, and .env (for DEEPSEEK_API_KEY)
       - hfcache:/hf   # BGE model cache: downloaded once, reused every run

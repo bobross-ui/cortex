@@ -1,71 +1,88 @@
 # Cortex
 
-> **Social Data → Vector Knowledge Base → Grounded Chat.** A personal RAG system that turns your
-> social-media exports into a searchable, citable knowledge base you can ask questions of.
+> **Social export → vector knowledge base → grounded chat.** Turn a personal social-media export
+> into a searchable, citable knowledge base you can ask questions of — *"What does this person think
+> about remote work?"* — answered with cited sources.
 
-![status](https://img.shields.io/badge/status-Layer%203%20shipped-brightgreen)
+![status](https://img.shields.io/badge/status-Layers%201--4%20shipped%20(Twitter)-brightgreen)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![tests](https://img.shields.io/badge/tests-pytest-green)
 
-Cortex ingests your data exports from LinkedIn, Twitter/X, and Instagram, extracts the content
-that actually *represents you* (and discards the noise), builds a vector knowledge base, and lets
-you ask questions like *"What do I think about remote work?"* — answered with cited sources.
-**Efficiency is a first-class requirement, not a bonus.**
+```mermaid
+flowchart LR
+    A["Social export<br/>(Twitter · LinkedIn · Instagram)"] --> B
+    subgraph L1["Layer 1 · Ingestion"]
+      B["SourceParser registry<br/>KEEP authored / DROP noise<br/>stitch self-reply threads"] --> C["ContentItem<br/>(canonical model)"]
+    end
+    C --> D
+    subgraph L2["Layer 2 · Vector KB"]
+      D["structure-aware chunk<br/>+ deterministic enrich"] --> E[("Postgres<br/>+ pgvector")]
+    end
+    subgraph S["one chunk row, three texts"]
+      direction TB
+      T1["text — raw, for citation + FTS source"]
+      T2["embed_text — vector(384), semantic"]
+      T3["fts — tsvector, lexical"]
+    end
+    E -.- S
+    E --> F
+    subgraph L3["Layer 3 · RAG"]
+      F["hybrid retrieve<br/>semantic KNN + FTS, RRF"] --> G["grounded prompt<br/>→ DeepSeek"] --> H["cited answer"]
+    end
+    H --> I["React chat UI"]
+```
+
+> **Layer 4 (efficiency) is cross-cutting:** streaming parse · batched embedding · within-run dedup ·
+> cross-run vector reuse · single-transaction writes.
 
 ---
 
 ## The brief
 
-An end-to-end system built across four layers, each of which matters:
+An end-to-end system across four layers, each of which matters:
 
-1. **Multi-source ingestion** — parse LinkedIn (CSV), Twitter/X (JSON), Instagram (JSON/HTML).
-   Keep authored content, discard noise. Adding a 4th source should take **under an hour**.
-2. **Vector knowledge base** — chunk intelligently (not by character count), embed, and store with
-   a self-designed schema that's extensible to new content types without a rewrite.
+1. **Multi-source ingestion** — parse LinkedIn (CSV), Twitter/X (JSON), Instagram (JSON/HTML); keep
+   authored content, discard noise. Adding a 4th source should take **under an hour**.
+2. **Vector knowledge base** — chunk intelligently (not by character count), embed, and store with a
+   self-designed schema that extends to new content types without a rewrite.
 3. **Chat (RAG)** — a minimal UI that retrieves relevant chunks and returns a grounded answer with
    **cited sources**.
-4. **Efficiency** — survive 50MB+ exports: batching, deduplication, incremental upserts, with
+4. **Efficiency** — survive 50 MB+ exports via batching, deduplication, and incremental upserts, with
    **named tradeoffs**.
 
----
-
-## Roadmap
-
-**Layers 1–4 are shipped on the Twitter path.** Layer 4's efficiency is proven by a seeded stress
-harness; the full multi-source brief (LinkedIn + Instagram parsers) is still incomplete.
+**What's shipped:** all four layers, end-to-end, on the **Twitter path**. The LinkedIn and Instagram
+parsers are not built — the layers beneath them are platform-agnostic and ready for them (see
+[Design Q&A](#design-questions--answers)).
 
 | Layer | Scope | Status |
 |---|---|---|
-| **1 — Ingestion** | Pluggable parsers; authored-content extraction; Twitter first | ✅ **Shipped** |
-| **2 — Vector KB** | Structure-aware chunking, local embeddings, pgvector schema | ✅ **Shipped** |
-| **3 — Chat (RAG)** | Retrieval, grounded prompt, cited answers, UI | ✅ **Shipped** |
-| **4 — Efficiency** | Streaming parse, batched writes, cross-run reuse, correctness invalidation | ✅ **Shipped (Twitter path)** |
+| **1 — Ingestion** | Pluggable parsers; authored-content extraction; Twitter first | ✅ Shipped |
+| **2 — Vector KB** | Structure-aware chunking, local embeddings, pgvector schema | ✅ Shipped |
+| **3 — Chat (RAG)** | Retrieval, grounded prompt, cited answers, UI | ✅ Shipped |
+| **4 — Efficiency** | Streaming parse, batched writes, cross-run reuse, correctness invalidation | ✅ Shipped (Twitter) |
 
 ---
 
-## Layer 1 — Multi-source ingestion
+## Layer 1 — Ingestion
 
-The job of Layer 1 is to turn a raw platform export (a folder of files) into a clean stream of
-canonical `ContentItem`s — keeping what represents the person, dropping the noise, and **reporting
-what it dropped** so the editorial decision is provable, not just claimed.
+Turns a raw platform export (a folder of files) into a clean stream of canonical `ContentItem`s,
+keeping what represents the person, dropping the noise, and **reporting what it dropped** so the
+editorial decision is provable, not just claimed.
 
-### Key decisions
-
-| Decision | What & why |
-|---|---|
-| **Pluggable parser seam** | One canonical model (`ContentItem`) + a `SourceParser` ABC + a registry. Adding a source = one new file + one `register()` line, nothing downstream changes. This is what makes *"4th source < 1 hour"* real. |
-| **Directory-root dispatch** | Real exports are **folders** (often split across part-files), not single files. Parsers operate on an extracted export directory and read account-level identity files first. |
-| **KEEP vs DROP is explicit** | An editorial policy (authored posts/threads/quotes/bio **keep**; retweets, replies-to-others, ads, likes, DMs **drop**) — recorded, and backed by an **ingestion report** (kept / dropped / skipped counts + reasons) as evidence. |
-| **Stitch threads at parse time** | A self-reply thread becomes **one** `ContentItem` (root id as `external_id`), so a thought stays whole and yields one coherent citation. |
-| **Parser-owned normalization** | The parser emits clean canonical text (unescape entities, expand/strip links, collapse whitespace, drop empty/media-only items) so downstream hashing/embedding is stable. |
-| **Stable `external_id`** | Native platform id (root id for threads; `profile` for bio) → re-ingesting the same export updates in place instead of duplicating. |
-| **`metadata` convention** | Per-`content_type` JSONB extras follow a documented key convention → extensible to new content types **without a migration**. |
-| **Twitter first, sources verified** | The Twitter archive format was verified against the canonical community parser and a real June 2026 export. Quote-status link handling is validated; retweet-shape handling remains unverified because the real export contained no retweets. |
-| **Defensive parsing** | Tolerate missing fields; skip malformed/empty items and record them; never crash a run on one bad item. |
-
-### The canonical model
-
-Every parser emits the same shape — downstream code knows only this:
+- **Pluggable seam** — one canonical model (`ContentItem`) + a `SourceParser` ABC + a registry.
+  Adding a source = one new file + one `register()` line; nothing downstream changes.
+- **Directory-root dispatch** — real exports are folders (often split across part-files), not single
+  files. Parsers read account-level identity files first.
+- **Explicit KEEP vs DROP** — an editorial policy backed by an ingestion report (kept / dropped /
+  skipped counts + reasons) as evidence.
+- **Threads stitched at parse time** — a self-reply chain becomes **one** `ContentItem` (root id as
+  `external_id`) → one coherent citation.
+- **Parser-owned normalization** — clean canonical text (unescape entities, strip/expand links,
+  collapse whitespace, drop media-only) so downstream hashing/embedding is stable.
+- **Stable `external_id` + JSONB `metadata`** — re-ingesting updates in place; per-`content_type`
+  extras extend to new types without a migration.
+- **Defensive** — tolerate missing fields, skip malformed/empty items (recorded), never crash on one
+  bad item.
 
 ```python
 @dataclass
@@ -80,389 +97,279 @@ class ContentItem:
     metadata: dict                # per-content_type extras → JSONB, extensible without migration
 ```
 
-### Twitter — KEEP vs DROP
+**Twitter KEEP vs DROP**
 
 | KEEP (represents the person) | DROP (noise) |
 |---|---|
 | original tweets, stitched self-reply threads, quote-tweets with commentary, profile bio | retweets, replies to others, likes, DMs, blocks, ad/impression data |
 
-### Tech (Layer 1)
+The Twitter format was verified against the canonical community archive parser and a real June 2026
+export. Quote-status link handling is validated; **retweet-shape handling is unverified** — the
+audited export contained no retweets.
 
-Python **3.11+**, the standard library (`json`, `html`, `re`, `datetime`, `pathlib`, `dataclasses`),
-and `ijson` for streaming export arrays, with **pytest** for tests. No database, embeddings, or
-network calls at this layer.
+*Tech: Python 3.11+, standard library, `ijson` for streaming export arrays. No DB, embeddings, or
+network at this layer.*
 
 ---
 
 ## Layer 2 — Vector knowledge base
 
-Layer 2 takes Layer 1's canonical `ContentItem`s and builds the vector knowledge base:
-structure-aware chunking → deterministic embedding-input enrichment → local BGE embeddings →
-Postgres + pgvector storage with incremental, deduplicated upserts.
+Takes Layer 1's `ContentItem`s and builds the store: structure-aware chunking → deterministic
+embed-input enrichment → local BGE embeddings → Postgres + pgvector with incremental, deduplicated
+upserts. (Retrieval and RAG live in Layer 3; Layer 2 only provisions the search seam.)
 
-Retrieval, RAG prompts, chat UI, reranking, and hybrid search logic are **not** in this layer.
-Layer 2 only provisions the storage/search seam that makes those cheap to add later.
+- **One Postgres + pgvector store** for documents, chunks, JSONB metadata, FTS, and vectors — a
+  production-shaped path without a separate vector database.
+- **Local embeddings** — `BAAI/bge-small-en-v1.5`, 384-dim, deterministic, offline after first
+  download, no hosted cost or rate limits.
+- **Raw text ≠ embed text** — `*.text` stays raw for citations and FTS; `chunks.embed_text` adds
+  deterministic context only for the vector. Future LLM enrichment swaps in at `build_embed_text()`
+  without a schema change.
+- **Structure-aware chunking** — records stay atomic by default; long stitched threads split on
+  paragraph/sentence boundaries with token budgets and overlap. No character-window shredding.
+- **Incremental + dedup** — a change hash skips unchanged documents entirely; identical `embed_text`
+  is embedded once per run; unchanged vectors are reused across runs by `(content_hash, embed_model)`.
+- **`content_type` is `TEXT`, not an enum** — new types are new strings + JSONB keys, no `ALTER TYPE`.
 
-### Key decisions
+**Two tables.** `documents` (one row per `ContentItem`, unique on `(source_platform, external_id)`
+for idempotent upsert) and `chunks` (one row per retrievable unit; FK to `documents`, `vector(384)`,
+generated FTS, JSONB metadata, filter columns). Indexes: HNSW cosine over `embedding`, GIN over `fts`,
+plus hash / source-type / created-at lookups.
 
-| Decision | What & why |
-|---|---|
-| **Postgres + pgvector** | One durable relational store for source documents, retrievable chunks, JSONB metadata, FTS, and vectors. `pgvector` gives a production-shaped path without adding a separate vector database. |
-| **Local embeddings** | `BAAI/bge-small-en-v1.5` is the default model. It is 384-dimensional, deterministic enough for repeatable indexing, offline after the first download, and avoids hosted embedding cost/rate limits. |
-| **Raw text ≠ embed text** | `documents.text` and `chunks.text` stay raw for source display, citations, and FTS. `chunks.embed_text` adds deterministic context only for embedding. Hashes are separate for documents vs chunks. |
-| **Structure-aware chunking** | Social records stay atomic by default. Long stitched threads split on paragraphs/sentences with token budgets and overlap; no character-window shredding. |
-| **Templated enrichment seam** | A single `build_embed_text()` function adds `[platform · type · date]` plus the profile bio as standing context. Future LLM enrichment can swap in here without a schema rewrite. |
-| **Incremental document skip** | A change hash over raw text plus deterministic embedding context detects unchanged documents. Re-indexing an unchanged export skips chunking and embedding entirely. |
-| **Embed dedup and reuse** | Identical `embed_text` strings are embedded once per run; stored vectors are reused across runs by `(content_hash, embed_model)` when part of a changed document remains unchanged. |
-| **Extensible content types** | `content_type` is `TEXT`, not a Postgres enum. New types are new strings + JSONB metadata keys; no `ALTER TYPE` migration. |
-| **Hybrid-ready, not hybrid yet** | Chunks have generated `fts` and a GIN index for Layer 3 hybrid retrieval, but Layer 2 only ships a small cosine search helper. |
-
-### Text and hash mapping
+**Three texts, two hashes — each with one job:**
 
 | Column | Contains | Purpose |
 |---|---|---|
-| `documents.text` | full original authored text | citation/source display |
-| `documents.content_hash` | `sha256(text + platform + type + date + enrichment context)` | document-level change detection without stale embedding context |
-| `chunks.text` | raw chunk slice | matched passage display + FTS source |
+| `documents.text` | full original authored text | citation / source display |
+| `documents.content_hash` | `sha256(text + platform + type + date + enrichment ctx)` | document-level change detection |
+| `chunks.text` | raw chunk slice | matched-passage display + FTS source |
 | `chunks.embed_text` | deterministic context prefix + raw chunk | passage embedding input |
-| `chunks.content_hash` | `sha256(chunks.embed_text)` | within-run dedup and same-model cross-run vector reuse key |
-| `chunks.fts` | generated `tsvector` from raw chunk text | Layer 3 lexical/hybrid search |
+| `chunks.content_hash` | `sha256(embed_text)` | within-run dedup + cross-run vector reuse key |
+| `chunks.fts` | generated `tsvector` from raw chunk | lexical / hybrid search |
 | `chunks.embedding` | `vector(384)` from BGE | semantic search |
 
-### Schema
+On the bundled Twitter fixture a clean run inserts **58 documents / 60 chunks** (the two extra chunks
+are long stitched threads `2300` and `2400`). Re-running reports **58 unchanged skipped, 0 embedded**.
+The CLI returns an `IndexReport` with new/updated/skipped, chunks inserted/embedded/reused/deduped,
+batch count, and durations.
 
-Layer 2 creates two tables:
-
-| Table | Meaning |
-|---|---|
-| `documents` | one row per `ContentItem`; unique on `(source_platform, external_id)` for idempotent upsert |
-| `chunks` | one row per retrievable unit; foreign key to `documents`, `vector(384)`, generated FTS, JSONB metadata, filter columns |
-
-Indexes:
-
-- `chunks_embedding_hnsw` — HNSW cosine index over `embedding vector_cosine_ops`
-- `chunks_fts_gin` — GIN index over generated `fts`
-- `chunks_hash_idx` — chunk embed-text hash lookup
-- `chunks_filter_idx` — source/content-type filters
-- `chunks_created_idx` — time filters
-- `documents_source_platform_external_id_key` — deterministic document identity
-
-### Index report
-
-The Layer 2 CLI returns an `IndexReport`:
-
-```python
-@dataclass
-class IndexReport:
-    platform: str
-    documents_new: int
-    documents_updated: int
-    documents_unchanged_skipped: int
-    chunks_inserted: int
-    chunks_embedded: int
-    chunks_reused_cross_run: int
-    chunks_dedup_within_run: int
-    embed_batches: int
-    duration_s: float
-    embed_duration_s: float
-```
-
-On the bundled Twitter fixture, a clean index run currently inserts **58 documents** and **60
-chunks**. The two extra chunks come from long stitched threads `2300` and `2400`.
-
-Re-running the same export reports **58 unchanged skipped** and **0 chunks embedded**.
-
-### Tech (Layer 2)
-
-Python **3.11+**, `sentence-transformers`, `BAAI/bge-small-en-v1.5`, `psycopg 3`,
-`pgvector`, `Postgres 16 + pgvector`, `numpy`, `pydantic-settings`, and `pytest`.
-
-Named tradeoffs:
-
-- Local embeddings pull a large `torch` stack, but make embedding $0, offline-after-cache, and
-  rate-limit-free.
-- Token counting uses a deterministic `words × 1.3` estimate instead of the model tokenizer, so
-  pure tests do not download the model and chunk boundaries stay stable.
-- The pipeline holds pending chunks and Python `list[float]` vectors in memory to preserve batch
-  efficiency. The 10k-chunk RSS cost is measured in Layer 4 — Efficiency (Measured numbers).
+*Tech: `sentence-transformers`, `psycopg 3`, `pgvector`, Postgres 16, `numpy`, `pydantic-settings`.*
 
 ---
 
 ## Layer 3 — Chat (RAG)
 
-Layer 3 turns the Layer 2 store into a single-turn grounded chat path:
-query embedding → retrieval → citation join → grounded prompt → DeepSeek → cited answer → React UI.
+A single-turn grounded path: query embedding → retrieval → citation join → grounded prompt →
+DeepSeek → cited answer → React UI.
 
-### Key decisions
+- **Single-turn** — `/chat` answers one question; multi-turn, query rewriting, reranking, and MMR are
+  deferred to keep the slice reliable.
+- **Hybrid default** — semantic KNN + Postgres FTS fused with Reciprocal Rank Fusion. On by default:
+  it didn't regress the fixture and should give better lexical coverage on real exports.
+- **BGE query instruction on queries only** — passages stay as Layer 2 wrote them; queries prepend
+  `Represent this sentence for searching relevant passages:`.
+- **Document-level citations** — retrieval starts from chunks, then joins to `documents` for `url`,
+  `external_id`, `author_handle`, and full text. Multiple chunks from one document collapse to one
+  source. The LLM gets full document text under `chat_context_char_cap`, else the matched chunk.
+- **Citations enforced** — if sources exist and the answer has no valid `[n]` markers, the
+  non-streaming API retries once with a citation nudge; the response carries `grounded` and per-source
+  `cited` flags.
+- **DeepSeek via OpenAI SDK** — `deepseek-v4-flash`, thinking disabled, low temperature for grounded
+  fidelity over creative phrasing.
 
-| Decision | What & why |
-|---|---|
-| **Single-turn chat** | `/chat` answers one question at a time. Conversation history, query rewriting, reranking, and MMR are deferred to keep the vertical slice reliable. |
-| **BGE query instruction only on queries** | Passage embeddings stay exactly as Layer 2 wrote them. Query embeddings prepend `Represent this sentence for searching relevant passages:` to match BGE's retrieval guidance. |
-| **Citation join is document-level** | Retrieval starts from chunks, then joins back to `documents` for `url`, `external_id`, `author_handle`, and full source text. Multiple chunks from one document collapse to one source. |
-| **Bounded document context** | The LLM gets full document text when it is under `chat_context_char_cap` and falls back to the matched chunk for long documents. The UI shows the matched chunk as the snippet. |
-| **DeepSeek via OpenAI SDK** | `DeepSeekChatClient` uses the OpenAI-compatible API at `https://api.deepseek.com`, model `deepseek-v4-flash`, with thinking disabled for grounded low-temperature RAG. |
-| **Citations are enforced** | If sources exist and the first answer has no valid `[n]` markers, the API retries once with an explicit citation nudge. The response includes `grounded` and per-source `cited` flags. |
-| **Streaming UI** | `/chat/stream` streams answer tokens with server-sent events, then sends final cited sources after the complete answer is available for citation parsing. |
-| **Hybrid default** | Semantic KNN and Postgres FTS are fused with Reciprocal Rank Fusion. Hybrid is enabled by default because it did not regress on the fixture and should provide better lexical coverage on real exports. |
-
-### API contract
-
-`POST /chat` returns a complete JSON response. `POST /chat/stream` accepts the same request body and
-returns `text/event-stream`: `token` events while the model writes, then a final `sources` event with
-the same response schema fields, followed by `done`. The non-streaming endpoint retries once if the
-model cites nothing; the streaming endpoint cannot retract already-sent text, so it reports the final
-`grounded` flag honestly.
-
-```json
-{
-  "question": "What does this person think about remote work?",
-  "filters": { "source_platform": "twitter", "content_type": "thread" }
-}
-```
-
-Streaming event example:
-
-```text
-event: token
-data: {"text":"They value async communication"}
-
-event: sources
-data: {"answer":"They value async communication [2].","sources":[...],"abstained":false,"grounded":true}
-
-event: done
-data: {}
-```
-
-Response:
+**API.** `POST /chat` returns complete JSON. `POST /chat/stream` takes the same body and returns SSE:
+`token` events while writing, then a final `sources` event (full schema), then `done`. The streaming
+endpoint can't retract sent text, so it reports the final `grounded` flag honestly rather than
+retrying.
 
 ```json
+// POST /chat  →
 {
   "answer": "They value async communication for deep work [2].",
-  "sources": [
-    {
-      "index": 2,
-      "external_id": "1001",
-      "platform": "twitter",
-      "content_type": "thread",
-      "url": "https://twitter.com/cortex_demo/status/1001",
-      "author_handle": "cortex_demo",
-      "date": "2024-05-15",
-      "snippet": "Some hard-won thoughts on remote work, a thread...",
-      "score": 0.7309,
-      "cited": true
-    }
-  ],
-  "abstained": false,
-  "grounded": true
+  "sources": [{
+    "index": 2, "external_id": "1001", "platform": "twitter", "content_type": "thread",
+    "url": "https://twitter.com/cortex_demo/status/1001", "author_handle": "cortex_demo",
+    "date": "2024-05-15", "snippet": "Some hard-won thoughts on remote work, a thread...",
+    "score": 0.7309, "cited": true
+  }],
+  "abstained": false, "grounded": true
 }
 ```
 
-### Retrieval eval
-
-The bundled eval in `eval/gold_set.py` / `eval/retrieval_eval.py` is a **sanity check**, not a
-benchmark. It verifies that semantic-only and hybrid retrieval both find the expected documents. The
-fixture is too small and too clean to demonstrate a hybrid quality lift, but hybrid did not regress
-the measured fixture, so `retrieval_hybrid=True` is the default for better lexical coverage on real
-exports.
-
-| Query class | What happened | Implication |
-|---|---|---|
-| Paraphrase questions | FTS usually returned no rows because `websearch_to_tsquery` over the full question is strict on unmatched terms. | Hybrid mostly collapsed to semantic-only. |
-| Exact-token questions | Semantic already ranked every expected lexical target at `#1`. | Hybrid had no measurable room to improve on this fixture. |
-| Hardest semantic query | `how do interruptions affect deep focus?` ranked expected source `2400` at `#4` in both modes. | Hybrid did not fix semantic misses without useful lexical overlap. |
-
-A stronger real-export eval should include lexical-hard queries where semantic does not already rank
-the target first, rare handles/product names/hashtags, and query preprocessing for FTS before making
-quality claims from the numbers.
-
-Named tradeoff: low `chat_temperature` favors grounded fidelity over creative phrasing.
+**Eval is a sanity check, not a benchmark.** `eval/retrieval_eval.py` verifies semantic and hybrid
+both find the expected documents. The fixture is too small/clean to show a hybrid quality lift —
+paraphrase queries mostly collapsed hybrid to semantic-only (`websearch_to_tsquery` is strict on
+unmatched terms), and semantic already ranked exact-token targets at `#1`. A real eval needs
+lexical-hard queries where semantic misses, rare handles/hashtags, and FTS query preprocessing before
+any quality claim.
 
 ---
 
 ## Layer 4 — Efficiency
 
-Most of the main efficiency levers were already paid for in Layers 1–2: batched local embedding,
-within-run embedding deduplication, unchanged-document skips, and idempotent upserts. Layer 4 adds the
-remaining implementation mechanisms plus a seeded stress harness that measures the throughput and
-flat-memory claims on a large synthetic Twitter archive.
+Most levers were paid for in Layers 1–2 (batched embedding, within-run dedup, unchanged-document
+skips, idempotent upserts). Layer 4 adds the rest plus a seeded stress harness that measures the
+throughput and flat-memory claims.
 
-| Mechanism | Status | Effect |
-|---|---|---|
-| Batch embedding | ✅ Shipped earlier | Embeds unique passage inputs in batches of 64. |
-| Within-run embedding deduplication | ✅ Shipped earlier | Embeds identical `embed_text` once per run. |
-| Document-level incremental skip | ✅ Shipped earlier, corrected in Layer 4 | Unchanged documents skip chunking and embedding; the change hash now includes enrichment context. |
-| Streaming Twitter row parsing | ✅ Layer 4 | Avoids materializing the raw tweet file and its full decoded row list simultaneously. |
-| Single-transaction writes | ✅ Layer 4 | Removes one database commit per changed document while keeping `executemany` chunk inserts. |
-| Same-model cross-run vector reuse | ✅ Layer 4 | Reuses unchanged chunk vectors from changed documents by `(content_hash, embed_model)`. |
-| Controlled 5/25/50 MB and ~10k-chunk proof | ✅ Layer 4 | Seeded stress harness measures flat parse RSS and ~10k-chunk throughput/RSS (see Measured numbers). |
+| Mechanism | Effect |
+|---|---|
+| Streaming Twitter row parsing | never materializes the raw file and full decoded row list at once |
+| Single-transaction writes | removes one commit per changed document; keeps `executemany` chunk inserts |
+| Same-model cross-run vector reuse | reuses unchanged chunk vectors from changed documents by `(content_hash, embed_model)` |
+| Enrichment-context invalidation | change hash includes enrichment context, so a bio edit correctly reprocesses dependents |
 
-`IndexReport.chunks_embedded` and `chunks_reused_cross_run` count distinct embedding inputs;
-`chunks_inserted` counts stored chunk rows.
-
-### Memory model
-
-Streaming removes the raw tweet file and full parsed-row list from the parser's retained state.
-Memory is still `O(unique valid tweet ids) + O(authored content)`, because the parser keeps the
-deduplication id set and authored records needed for thread stitching. It is therefore **not**
-constant-memory, but noise content is processed and discarded instead of accumulated.
-
-The embedding/write phase still holds pending chunks and vectors in memory to preserve batch
-efficiency. `SentenceTransformerEmbedder` returns Python `list[float]` vectors, so their in-memory
-cost is materially larger than the compact `float32` wire/disk representation. The 10k-chunk RSS cost
-and flat-memory behavior across controlled large tweet files are measured below.
-
-A real June 2026 Twitter export was audited as compatibility evidence: the complete archive was
-48.7 MB, but the parser-relevant account/profile/tweet files totaled only 72,964 bytes. It parsed in
-about 0.03 seconds with approximately 22.5 MB peak process RSS and produced 21 kept items. This
-validates real-export compatibility, **not** 50 MB tweet-file scalability.
+**Memory model.** Streaming removes the raw file and parsed-row list from retained state, but memory
+is still `O(unique valid tweet ids) + O(authored content)` — the parser keeps the dedup id set and
+authored records for thread stitching. So it is **flat with respect to file size, bounded by authored
+count — not constant memory.** The embed/write phase holds pending chunks and Python `list[float]`
+vectors to preserve batch efficiency, which costs materially more RAM than the compact `float32`
+representation.
 
 ### Measured numbers
 
-Illustrative, not a benchmark — the figures are machine-relative and the machine is named below. The
-harness (`eval/bench.py`) builds a seeded synthetic archive (`eval/stress_fixture.py`), runs the real
-pipeline against an isolated `cortex_bench` database (never the demo database, and truncated first so
-cross-run reuse cannot fake the throughput number), and prints these values. Throughput uses ~10k
-distinct chunks so within-run dedup cannot collapse them; parse memory is measured in a subprocess
-with no model loaded.
+Illustrative, not a benchmark — figures are machine-relative. The harness (`eval/bench.py`) builds a
+seeded synthetic archive, runs the real pipeline against an isolated `cortex_bench` DB (truncated
+first so reuse can't fake throughput), and prints these. Reproduce with `python -m eval.bench`.
 
 | Measurement | Value | Notes |
 |---|---|---|
-| Embed throughput | 382 chunks/s | CPU, `bge-small-en-v1.5`, batch 64 |
-| End-to-end ingest (~10k chunks) | 43.5 s (229 chunks/s) | parse + chunk + embed + write |
-| Throughput-path peak RSS (delta over model baseline) | 140 MB | the in-memory `list[float]` vector cost — measured, **not** the 15 MB `float32` figure |
-| Re-ingest same export | 0 embedded, 0 batches (9,957 documents skipped) | document-level incremental skip |
-| Peak parse RSS @ 5 / 25 / 50 MB | 27.2 / 33.2 / 41.9 MB | roughly flat — streaming drops noise |
-| Machine | Apple Silicon (arm64), 10 logical cores, 16 GB RAM | numbers are machine-relative |
+| Embed throughput | **382 chunks/s** | CPU, `bge-small-en-v1.5`, batch 64 |
+| End-to-end ingest (~10k chunks) | **43.5 s** (229 chunks/s) | parse + chunk + embed + write |
+| Throughput-path peak RSS (Δ over model) | **140 MB** | the `list[float]` vector cost — **not** the 15 MB `float32` size |
+| Re-ingest same export | **0 embedded, 0 batches** | 9,957 documents skipped (incremental) |
+| Peak parse RSS @ 5 / 25 / 50 MB | **27.2 / 33.2 / 41.9 MB** | roughly flat — streaming drops noise |
+| Machine | Apple Silicon (arm64), 10 cores, 16 GB | numbers are machine-relative |
 
-The keystone result: a 10× growth in raw tweet-file size (5 → 50 MB) yields only ~1.5× growth in peak
-parse RSS. That residual rise is the `O(unique valid tweet ids)` term — noise ids are retained in the
-dedup set while their content is streamed and discarded — which is why the honest claim is *flat with
-respect to file size, bounded by authored count*, not *constant memory*. The 140 MB throughput-path
-figure confirms the in-memory `list[float]` vectors cost on the order of a hundred-plus megabytes for
-10k chunks, not the 15 MB compact `float32` size. Reproduce with `python -m eval.bench` (see Testing).
+**Keystone:** a 10× growth in raw tweet-file size (5 → 50 MB) yields only ~1.5× growth in peak parse
+RSS — the residual is the `O(unique valid tweet ids)` term. A real June 2026 export (48.7 MB archive,
+but only 72,964 parser-relevant bytes) parsed in ~0.03 s at ~22.5 MB RSS into 21 kept items: this
+proves real-export **compatibility**, not 50 MB tweet-file scalability.
 
-### Concurrency decisions
+**Concurrency was considered and intentionally not added:** multiprocessing embedding (each worker
+reloads the ~400 MB model — substantial memory for an unmeasured gain; torch already parallelizes
+intra-op), embed/write pipeline overlap (embedding dominates ≈26 s of the ≈43 s run; build overlap
+only if writes are shown material), parallel file reads, and HNSW drop/rebuild. Each is gated on
+measured need.
 
-Concurrency was considered and intentionally not added:
+---
 
-- **Parallel embedding via multiprocessing: deferred.** Torch already uses intra-op CPU parallelism
-  during model inference. Extra processes would each load another model copy, trading substantial
-  memory and operational complexity for an unmeasured throughput gain.
-- **Embedding/write pipeline overlap: deferred.** A producer/consumer pipeline could overlap CPU
-  embedding with database I/O, but it complicates failure handling and transaction boundaries. The
-  bench shows embedding dominates (≈26 s of a ≈43 s end-to-end run at 10k chunks); build the overlap
-  only if a write-isolating measurement shows database writes are material.
-- **Parallel file reads: not added.** The audited real export used one tweet file plus small
-  account/profile files; split tweet parts must preserve deterministic ordering, and there is no
-  evidence file I/O is the bottleneck.
-- **HNSW drop/rebuild during bulk seed: deferred.** It can improve very large initial loads, but
-  temporarily disables indexed search for concurrent readers and has not been shown to matter at the
-  current scale.
+## Design questions & answers
 
-### Named tradeoffs
+### What does the system do, and what are the two or three most important architecture decisions?
 
-- **Local embeddings choose cost and operational control over maximum quality.**
-  `BAAI/bge-small-en-v1.5` is offline-after-download, rate-limit-free, and costs $0 per chunk, at a
-  likely quality cost versus larger hosted embedding models.
-- **Batch size 64 balances speed and memory.** Larger batches may improve throughput but increase
-  peak RAM; the shipped default is a middle ground.
-- **Streaming targets the unbounded raw-file buffer, not every in-memory structure.** Keeping ids
-  and authored content enables deterministic deduplication and thread stitching.
-- **Holding vectors until the write phase favors batch efficiency over minimum RAM.** Switching to
-  `float32` arrays plus batched writes is the next lever if measured RSS becomes a problem.
-- **One transaction plus `executemany` favors simplicity and atomicity over COPY throughput.** It
-  eliminates per-document commits without introducing pgvector COPY-format handling. The tradeoff is
-  a longer write transaction.
-- **Cross-run reuse is model-specific.** Reuse is valid only for the same `embed_model`; changing
-  models correctly forces re-embedding.
-- **Bio changes favor correctness over a cheap stale skip.** Because the bio enriches non-bio
-  passage embeddings, changing it intentionally reprocesses every dependent document.
-- **Concurrency favors clarity and memory over speculative speedups.** Multiprocessing, pipeline
-  overlap, and index rebuild optimizations remain gated on measured need.
+Cortex turns a personal export into a citable knowledge base: ingest a folder → keep what represents
+the person → chunk, embed, and store in Postgres + pgvector → answer questions with a grounded,
+source-cited RAG answer in a small React UI. Three decisions carried the most weight, one per axis:
 
-Layer 4's efficiency is proven on the shipped Twitter path; the full multi-source brief (LinkedIn +
-Instagram parsers) is still incomplete.
+1. **A single canonical `ContentItem` behind a pluggable `SourceParser` registry.** Every parser
+   emits the same shape, so a new source is one file + one `register()` line and nothing downstream
+   changes — that is what makes *"a 4th source under an hour"* a real property, and why Twitter-only
+   today doesn't imply a rewrite tomorrow.
+2. **One Postgres + pgvector store with a deliberately separated schema.** Raw `text` (citation) ≠
+   `embed_text` (semantic) ≠ `fts` (lexical) — three texts, two hashes, each one job — and
+   `content_type` is `TEXT`, never an enum, so new types need no migration. One relational store gives
+   documents, vectors, full-text, and metadata filters without a second database.
+3. **Local `bge-small-en-v1.5` embeddings — forced by constraint, not taste.** No OpenAI/Anthropic key
+   exists here and DeepSeek is chat-only with no embeddings endpoint, so a local model is the *only*
+   viable embedder. It also happens to be $0, offline, and rate-limit-free, at a real quality cost
+   versus a hosted model.
+
+### Where is the bottleneck at 10× data volume? What breaks first?
+
+Assume 10× *authored* content (~100k chunks) — raw-file size is mostly noise that streams away. The
+order is **embedding compute → vector-holding RAM → (only much later) the store.** At ~382 chunks/s on
+one CPU, embedding already dominates ingest (~26 s of a ~43 s run at 10k); 100k is ~4–5 minutes of
+pure CPU embedding — the time bottleneck, and exactly the lever Layer 4 deferred. The first thing to
+actually *break* (not just slow) is memory: ~140 MB of `list[float]` vectors at 10k → ~1.4 GB at 100k;
+the fix is `float32` numpy arrays plus batched/streamed writes. **Postgres/pgvector does not break
+first** — 100k rows in HNSW is unremarkable and `executemany` inserts are seconds. Ruling the DB out is
+most of the judgment here.
+
+### What did you consciously cut to stay in the window, and what would you build next?
+
+The largest deliberate cut is **multi-source breadth — only Twitter ships.** The seam, schema,
+chunking, RAG, and efficiency work are all source-agnostic, but the LinkedIn (CSV) and Instagram
+(JSON/HTML) parsers aren't built — one *vertical* slice proven end-to-end (ingest → KB → cited chat →
+measured efficiency) shows more judgment than three shallow ingestion paths. Within layers I also cut
+and named: cross-encoder reranking and MMR; multi-turn and query rewriting; LLM enrichment of short
+posts (the seam is built but left OFF to keep ingestion offline and deterministic); and retweet-shape
+validation (flagged — the audited export had no retweets).
+
+**Next:** the LinkedIn and Instagram parsers (they close the brief and the seam makes them cheap),
+then **selective LLM enrichment for short, context-poor posts** — the single biggest answer-quality
+knob, deferred only because it adds per-post network calls and non-determinism to ingestion. The
+`future.txt` backlog follows: **time-based ranking** (current views represent a person more than old
+ones), **likes as a signal** (what someone endorses also defines them), and **image analysis** (so
+visual posts stop being dropped as empty). Each is additive at an existing seam — a scoring term, a
+new `content_type`, a parser branch — not a rewrite.
+
+### If you had to make this architecture 10× better (rethink it, not iterate)?
+
+Iteration would be "bigger embedding model, add a reranker" — same machine, not what's asked. The
+genuine rethink is to stop treating the person as a **bag of chunks ranked by cosine similarity** and
+start treating them as a **structured set of claims and positions.** Top-k nearest passages is fragile
+exactly where it matters: it can't aggregate a view expressed across ten posts over two years, can't
+weigh a 2026 opinion over a 2019 one, and can't say "they changed their mind." A 10× system runs an
+offline LLM extraction pass over the authored corpus to build a **person-centric knowledge layer** —
+topics, stances, and timestamped evidence as structured rows or a small graph — so a question becomes
+a *synthesis* over a stance ("here's what they think about X, with citations, and how it shifted")
+rather than a similarity lookup, and retrieval becomes agentic and multi-hop. This moves the
+intelligence from query time to a richer ingestion-time model of the person — which is the actual
+product. The honest cost: extraction is expensive, non-deterministic, and needs its own eval harness —
+the very properties deliberately kept *out* of the current path to keep it cheap, offline, and
+provable in the time window.
 
 ---
 
 ## Getting started
 
-> **Prerequisites:** **Docker** (runs the database and backend) and **Node 18+** (frontend).
-> Python **3.11+** is only needed to run the test suite on the host.
+> **Prerequisites:** **Docker** (database + backend) and **Node 18+** (frontend). Python **3.11+** is
+> only needed to run the test suite on the host.
 
 ```bash
-# optional: add a DeepSeek API key for generated answers
+# optional: add a DeepSeek key for generated answers
 # (retrieval + cited sources work without it; chat returns 503 until a key is set)
 cp .env.example .env        # then edit DEEPSEEK_API_KEY=...
 
-# start Postgres + the API together
-docker compose up
+docker compose up           # Postgres + API together
+cd frontend && npm install && npm run dev   # React UI in another shell
 
-# start the React UI in another shell
-cd frontend
-npm install
-npm run dev
-
-# stop everything when done (indexed data persists in the pgdata volume)
-docker compose down
+docker compose down         # stop; indexed data persists in the pgdata volume
 ```
 
-Then open the URL Vite prints (typically <http://localhost:5173>); it proxies `/chat` and `/health`
-to the API on `http://localhost:8000`.
-
-The **first** `docker compose up` is the only slow run: it builds the backend image, downloads the
-BGE model into the `hfcache` volume, and indexes the bundled Twitter fixture once (auto-seed). Every
-later run reuses the cached image, the cached model, and the persisted vectors — embedding does
-**not** run again. Changed dependencies need a one-time `docker compose up --build`; to wipe the
-indexed data and re-seed from scratch, use `docker compose down -v`.
+Open the URL Vite prints (typically <http://localhost:5173>); it proxies `/chat` and `/health` to the
+API on `:8000`. The **first** `docker compose up` is the only slow run — it builds the image,
+downloads the BGE model into the `hfcache` volume, and auto-seeds the bundled Twitter fixture once.
+Later runs reuse all three and skip embedding entirely. Use `--build` after dependency changes;
+`down -v` to wipe and re-seed from scratch.
 
 ### Testing
 
-Tests run on the host against the Postgres started by `docker compose up`.
+Tests run on the host against the Postgres from `docker compose up`.
 
-> **Heads-up:** the integration tier `TRUNCATE`s the `chunks`/`documents` tables, so it wipes the
-> auto-seeded demo data. Run `docker compose restart api` afterward to re-seed.
+> **Heads-up:** the integration tier `TRUNCATE`s `chunks`/`documents`, wiping the auto-seeded demo
+> data. Run `docker compose restart api` afterward to re-seed.
 
 ```bash
-pip install -e ".[dev]"     # package + test extras (downloads the BGE model on first integration run)
+pip install -e ".[dev]"                      # package + test extras
 
-# pure tier — no DB, no model download
-pytest -m "not integration and not live"
+pytest -m "not integration and not live"     # pure tier — no DB, no model download
+pytest -m "integration and not live"         # real pgvector + real BGE (LLM faked)
+pytest -m live                               # optional live DeepSeek smoke test (needs key)
 
-# integration tier — real pgvector + real BGE model (LLM faked)
-pytest -m "integration and not live"
+python eval/retrieval_eval.py                # retrieval eval that decides the hybrid default
 
-# optional: live DeepSeek smoke test (requires DEEPSEEK_API_KEY in .env)
-pytest -m live
+psql "$DATABASE_URL" -c 'CREATE DATABASE cortex_bench'   # one-time for the bench
+python -m eval.bench                         # Layer 4 stress harness — prints measured numbers
 
-# retrieval eval that decides the hybrid default
-python eval/retrieval_eval.py
-
-# Layer 4 bench — seeded stress fixtures; prints the measured throughput/RSS numbers.
-# Throughput + idempotency use a separate cortex_bench database (create it once); parse-memory needs none.
-psql "$DATABASE_URL" -c 'CREATE DATABASE cortex_bench'   # one-time; skip if it exists
-python -m eval.bench
-
-# optional: inspect Layer 1 ingestion only (no DB, prints the ingestion report)
-python -m cortex.pipeline.ingest tests/fixtures/twitter
+python -m cortex.pipeline.ingest tests/fixtures/twitter   # Layer 1 only — prints the ingestion report
 ```
 
-The optional ingest command prints a one-line summary plus a JSON report, e.g.:
+The ingest command prints a one-line summary plus JSON, e.g.:
 
 ```
 twitter: 58 kept (bio 1, post 51, thread 6), 24 dropped (reply_to_other 13, retweet 11), 7 skipped (malformed 2, empty 5) in 0.002s
 ```
-
-On the **first** `docker compose up`, auto-seed indexes the fixture and the API logs the same kind of
-index report:
-
-```
-twitter: 58 changed (new 58, updated 0), 0 unchanged skipped, 60 chunks inserted, 60 chunks embedded, 0 reused cross-run (0 deduped), 1 embed batches in 1.518s
-```
-
-On every later `docker compose up`, the knowledge base already has rows, so seeding is skipped
-entirely — no model embedding work runs.
 
 ---
 
@@ -470,63 +377,30 @@ entirely — no model embedding work runs.
 
 ```
 cortex/
-├── README.md
-├── pyproject.toml
-├── Dockerfile                 # backend image for `docker compose up`
-├── docker-compose.yml         # Postgres + API, with persisted volumes
-├── .dockerignore
-├── .env.example
-├── .github/workflows/ci.yml
+├── Dockerfile · docker-compose.yml · .env.example   # one-command deploy (Postgres + API)
 ├── backend/cortex/
 │   ├── config.py              # settings from env / .env
 │   ├── models.py              # ContentItem, IngestionReport, IndexReport
+│   ├── ingestion/             # base ABC, registry, normalize, twitter parser
 │   ├── chunking/              # structure-aware chunker + embed_text enrichment
 │   ├── embedding/             # Embedder ABC + SentenceTransformerEmbedder
-│   ├── ingestion/             # base ABC, registry, normalize, twitter parser
+│   ├── store/                 # schema.sql, db connection, repository helpers
 │   ├── rag/                   # retriever, grounded prompt, DeepSeek chat client
 │   ├── api/                   # FastAPI /health and /chat
-│   ├── store/                 # schema.sql, db connection, repository helpers
 │   └── pipeline/              # ingest.py (Layer 1), index.py (Layer 2)
-├── eval/                      # retrieval gold set + semantic-vs-hybrid eval
+├── eval/                      # retrieval gold set, hybrid eval, Layer 4 bench
 ├── frontend/                  # Vite + React chat page
-└── tests/
-    ├── fixtures/twitter/      # synthetic test archive
-    ├── test_chunker.py
-    ├── test_enrich.py
-    ├── test_hashing_dedup.py
-    ├── test_store_integration.py
-    └── test_*.py
+└── tests/                     # pure + integration tiers, synthetic Twitter fixture
 ```
 
 ---
 
-## Status
+## Known limitations
 
-**Layer 1 (ingestion) is shipped** — the pluggable parser seam, the Twitter parser, and the
-ingestion report are implemented and covered by tests against a high-fidelity synthetic Twitter
-fixture.
-
-**Layer 2 (vector knowledge base) is shipped** — structure-aware chunking, deterministic
-enrichment, local BGE embeddings, Postgres + pgvector schema, incremental upsert, within-run
-embedding dedup, semantic search helper, and two-tier tests are implemented.
-
-**Layer 3 (chat/RAG) is shipped** — semantic retrieval, optional hybrid RRF retrieval, document-level
-citations, grounded prompt assembly, DeepSeek chat, FastAPI `/chat`, a minimal React UI, fake-LLM
-integration tests, and an optional live DeepSeek smoke test are implemented.
-
-**Layer 4 (efficiency) is shipped on the Twitter path** — streaming Twitter parsing, one-transaction
-writes, same-model cross-run vector reuse, and enrichment-context invalidation are implemented and
-tested, and a seeded stress harness measures the 5/25/50 MB flat-parse-RSS and ~10k-chunk
-throughput/RSS claims (see Layer 4 — Efficiency). The full multi-source brief is still incomplete.
-
-LinkedIn and Instagram parsers still follow on the Layer 1 seam. Layer 3 is platform-agnostic across
-whatever is in the store, but the full brief's multi-source requirement is not complete until those
-parsers land.
-
-> Known limitation: the retweet-shape classification rule is derived from secondary sources and
-> remains flagged for validation because the real June 2026 export used for parser auditing contained
-> no retweets. Quote-status link handling was validated against that export.
-
-> Known Layer 2 limitation: templated enrichment is the shipped zero-cost baseline. LLM enrichment
-> for short, context-poor posts is intentionally deferred; it is the likely answer-quality knob to
-> re-measure on a real corpus.
+- **Multi-source brief is incomplete** — only the Twitter path ships end-to-end. LinkedIn and
+  Instagram parsers follow on the Layer 1 seam; Layer 3 is already platform-agnostic over whatever is
+  in the store.
+- **Retweet-shape classification is unverified** — the rule is from secondary sources; the real June
+  2026 export used for auditing contained no retweets. Quote-status link handling *was* validated.
+- **Templated enrichment is the zero-cost baseline** — LLM enrichment for short, context-poor posts is
+  intentionally deferred; it is the likely answer-quality knob to re-measure on a real corpus.

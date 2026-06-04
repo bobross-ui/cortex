@@ -4,6 +4,11 @@ import "./styles.css";
 
 const EXAMPLE_QUESTION = "What does this person think about remote work?";
 
+// In production (e.g. Vercel) set VITE_API_BASE to the backend URL, e.g.
+// https://api.your-domain.com. Left empty for local dev so requests stay
+// relative and Vite's dev proxy forwards /chat and /health to localhost:8000.
+const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(/\/+$/, "");
+
 function App() {
   const [question, setQuestion] = useState(EXAMPLE_QUESTION);
   const [answer, setAnswer] = useState("");
@@ -15,7 +20,7 @@ function App() {
 
   useEffect(() => {
     let ignore = false;
-    fetch("/health")
+    fetch(`${API_BASE}/health`)
       .then((response) => {
         if (!response.ok) {
           throw new Error("unavailable");
@@ -51,7 +56,7 @@ function App() {
     setSources([]);
 
     try {
-      const response = await fetch("/chat/stream", {
+      const response = await fetch(`${API_BASE}/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: trimmed }),
