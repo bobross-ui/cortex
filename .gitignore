@@ -26,6 +26,10 @@ dist/
 node_modules/
 frontend/dist/
 
+# Real platform archives (personal data — never commit)
+twitter-20*/
+*-twitter-archive/
+
 # OS/editor files
 .DS_Store
 .claude/

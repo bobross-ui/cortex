@@ -70,7 +70,8 @@ def normalize_tweet(tweet: dict) -> tuple[str, str | None, int]:
         link = u.get("url")
         if not link:
             continue
-        # TODO: validate vs real archive
+        # Confirmed against one real archive (2 quote tweets): native quotes carry
+        # no quoted_status field — the only signal is a /status/<id> link in entities.urls.
         m = _STATUS_RE.search(u.get("expanded_url", ""))
         if m:
             quote_of_id = quote_of_id or m.group(1)

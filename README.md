@@ -31,15 +31,15 @@ An end-to-end system built across four layers, each of which matters:
 
 ## Roadmap
 
-**Layers 1–3 are shipped.** Layer 4's implementation mechanisms are present, while its controlled
-large-scale proof remains deferred.
+**Layers 1–4 are shipped on the Twitter path.** Layer 4's efficiency is proven by a seeded stress
+harness; the full multi-source brief (LinkedIn + Instagram parsers) is still incomplete.
 
 | Layer | Scope | Status |
 |---|---|---|
 | **1 — Ingestion** | Pluggable parsers; authored-content extraction; Twitter first | ✅ **Shipped** |
 | **2 — Vector KB** | Structure-aware chunking, local embeddings, pgvector schema | ✅ **Shipped** |
 | **3 — Chat (RAG)** | Retrieval, grounded prompt, cited answers, UI | ✅ **Shipped** |
-| **4 — Efficiency** | Streaming parse, batched writes, cross-run reuse, correctness invalidation | 🟡 **Mechanisms shipped; stress proof deferred** |
+| **4 — Efficiency** | Streaming parse, batched writes, cross-run reuse, correctness invalidation | ✅ **Shipped (Twitter path)** |
 
 ---
 
@@ -184,7 +184,7 @@ Named tradeoffs:
 - Token counting uses a deterministic `words × 1.3` estimate instead of the model tokenizer, so
   pure tests do not download the model and chunk boundaries stay stable.
 - The pipeline holds pending chunks and Python `list[float]` vectors in memory to preserve batch
-  efficiency. Controlled 10k-chunk RSS measurement remains deferred.
+  efficiency. The 10k-chunk RSS cost is measured in Layer 4 — Efficiency (Measured numbers).
 
 ---
 
@@ -284,8 +284,8 @@ Named tradeoff: low `chat_temperature` favors grounded fidelity over creative ph
 
 Most of the main efficiency levers were already paid for in Layers 1–2: batched local embedding,
 within-run embedding deduplication, unchanged-document skips, and idempotent upserts. Layer 4 adds the
-remaining implementation mechanisms while deliberately deferring the controlled stress harness and
-10k-chunk benchmark.
+remaining implementation mechanisms plus a seeded stress harness that measures the throughput and
+flat-memory claims on a large synthetic Twitter archive.
 
 | Mechanism | Status | Effect |
 |---|---|---|
@@ -295,7 +295,7 @@ remaining implementation mechanisms while deliberately deferring the controlled 
 | Streaming Twitter row parsing | ✅ Layer 4 | Avoids materializing the raw tweet file and its full decoded row list simultaneously. |
 | Single-transaction writes | ✅ Layer 4 | Removes one database commit per changed document while keeping `executemany` chunk inserts. |
 | Same-model cross-run vector reuse | ✅ Layer 4 | Reuses unchanged chunk vectors from changed documents by `(content_hash, embed_model)`. |
-| Controlled 5/25/50 MB and ~10k-chunk proof | ⏸ Deferred | No large-scale throughput or flat-RSS claim is made yet. |
+| Controlled 5/25/50 MB and ~10k-chunk proof | ✅ Layer 4 | Seeded stress harness measures flat parse RSS and ~10k-chunk throughput/RSS (see Measured numbers). |
 
 `IndexReport.chunks_embedded` and `chunks_reused_cross_run` count distinct embedding inputs;
 `chunks_inserted` counts stored chunk rows.
@@ -309,14 +309,38 @@ constant-memory, but noise content is processed and discarded instead of accumul
 
 The embedding/write phase still holds pending chunks and vectors in memory to preserve batch
 efficiency. `SentenceTransformerEmbedder` returns Python `list[float]` vectors, so their in-memory
-cost is materially larger than the compact `float32` wire/disk representation. The projected
-10k-chunk RSS cost and flat-memory behavior across controlled large tweet files remain unmeasured
-until the deferred stress harness is built.
+cost is materially larger than the compact `float32` wire/disk representation. The 10k-chunk RSS cost
+and flat-memory behavior across controlled large tweet files are measured below.
 
 A real June 2026 Twitter export was audited as compatibility evidence: the complete archive was
 48.7 MB, but the parser-relevant account/profile/tweet files totaled only 72,964 bytes. It parsed in
 about 0.03 seconds with approximately 22.5 MB peak process RSS and produced 21 kept items. This
 validates real-export compatibility, **not** 50 MB tweet-file scalability.
+
+### Measured numbers
+
+Illustrative, not a benchmark — the figures are machine-relative and the machine is named below. The
+harness (`eval/bench.py`) builds a seeded synthetic archive (`eval/stress_fixture.py`), runs the real
+pipeline against an isolated `cortex_bench` database (never the demo database, and truncated first so
+cross-run reuse cannot fake the throughput number), and prints these values. Throughput uses ~10k
+distinct chunks so within-run dedup cannot collapse them; parse memory is measured in a subprocess
+with no model loaded.
+
+| Measurement | Value | Notes |
+|---|---|---|
+| Embed throughput | 382 chunks/s | CPU, `bge-small-en-v1.5`, batch 64 |
+| End-to-end ingest (~10k chunks) | 43.5 s (229 chunks/s) | parse + chunk + embed + write |
+| Throughput-path peak RSS (delta over model baseline) | 140 MB | the in-memory `list[float]` vector cost — measured, **not** the 15 MB `float32` figure |
+| Re-ingest same export | 0 embedded, 0 batches (9,957 documents skipped) | document-level incremental skip |
+| Peak parse RSS @ 5 / 25 / 50 MB | 27.2 / 33.2 / 41.9 MB | roughly flat — streaming drops noise |
+| Machine | Apple Silicon (arm64), 10 logical cores, 16 GB RAM | numbers are machine-relative |
+
+The keystone result: a 10× growth in raw tweet-file size (5 → 50 MB) yields only ~1.5× growth in peak
+parse RSS. That residual rise is the `O(unique valid tweet ids)` term — noise ids are retained in the
+dedup set while their content is streamed and discarded — which is why the honest claim is *flat with
+respect to file size, bounded by authored count*, not *constant memory*. The 140 MB throughput-path
+figure confirms the in-memory `list[float]` vectors cost on the order of a hundred-plus megabytes for
+10k chunks, not the 15 MB compact `float32` size. Reproduce with `python -m eval.bench` (see Testing).
 
 ### Concurrency decisions
 
@@ -326,8 +350,9 @@ Concurrency was considered and intentionally not added:
   during model inference. Extra processes would each load another model copy, trading substantial
   memory and operational complexity for an unmeasured throughput gain.
 - **Embedding/write pipeline overlap: deferred.** A producer/consumer pipeline could overlap CPU
-  embedding with database I/O, but it complicates failure handling and transaction boundaries. Build
-  it only if the deferred benchmark shows database writes are material.
+  embedding with database I/O, but it complicates failure handling and transaction boundaries. The
+  bench shows embedding dominates (≈26 s of a ≈43 s end-to-end run at 10k chunks); build the overlap
+  only if a write-isolating measurement shows database writes are material.
 - **Parallel file reads: not added.** The audited real export used one tweet file plus small
   account/profile files; split tweet parts must preserve deterministic ordering, and there is no
   evidence file I/O is the bottleneck.
@@ -356,8 +381,8 @@ Concurrency was considered and intentionally not added:
 - **Concurrency favors clarity and memory over speculative speedups.** Multiprocessing, pipeline
   overlap, and index rebuild optimizations remain gated on measured need.
 
-Layer 4's implementation mechanisms are shipped on the Twitter path, but the controlled stress proof
-and the full multi-source brief remain incomplete.
+Layer 4's efficiency is proven on the shipped Twitter path; the full multi-source brief (LinkedIn +
+Instagram parsers) is still incomplete.
 
 ---
 
@@ -413,6 +438,11 @@ pytest -m live
 
 # retrieval eval that decides the hybrid default
 python eval/retrieval_eval.py
+
+# Layer 4 bench — seeded stress fixtures; prints the measured throughput/RSS numbers.
+# Throughput + idempotency use a separate cortex_bench database (create it once); parse-memory needs none.
+psql "$DATABASE_URL" -c 'CREATE DATABASE cortex_bench'   # one-time; skip if it exists
+python -m eval.bench
 
 # optional: inspect Layer 1 ingestion only (no DB, prints the ingestion report)
 python -m cortex.pipeline.ingest tests/fixtures/twitter
@@ -484,9 +514,10 @@ embedding dedup, semantic search helper, and two-tier tests are implemented.
 citations, grounded prompt assembly, DeepSeek chat, FastAPI `/chat`, a minimal React UI, fake-LLM
 integration tests, and an optional live DeepSeek smoke test are implemented.
 
-**Layer 4 (efficiency) is partially shipped** — streaming Twitter parsing, one-transaction writes,
-same-model cross-run vector reuse, and enrichment-context invalidation are implemented and tested.
-The controlled 5/25/50 MB parse-memory proof and ~10k-chunk throughput/RSS benchmark are deferred.
+**Layer 4 (efficiency) is shipped on the Twitter path** — streaming Twitter parsing, one-transaction
+writes, same-model cross-run vector reuse, and enrichment-context invalidation are implemented and
+tested, and a seeded stress harness measures the 5/25/50 MB flat-parse-RSS and ~10k-chunk
+throughput/RSS claims (see Layer 4 — Efficiency). The full multi-source brief is still incomplete.
 
 LinkedIn and Instagram parsers still follow on the Layer 1 seam. Layer 3 is platform-agnostic across
 whatever is in the store, but the full brief's multi-source requirement is not complete until those
